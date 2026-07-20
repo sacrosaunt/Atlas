@@ -1,0 +1,10 @@
+.DS_Store
+node_modules/
+.venv*/
+bin/
+*.log
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.mlmodelc/
+*.mlpackage/Data/
