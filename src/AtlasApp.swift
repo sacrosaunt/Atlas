@@ -11,6 +11,7 @@ private let firstInsightsNotificationKey = "atlas.firstInsightsNotification.sent
 private extension Notification.Name {
     static let atlasOpenInsights = Notification.Name("AtlasOpenInsights")
     static let atlasOpenSettings = Notification.Name("AtlasOpenSettings")
+    static let atlasFindInChat = Notification.Name("AtlasFindInChat")
 }
 
 private enum FirstInsightsNotifier {
@@ -131,6 +132,28 @@ private func atlasPauseText(_ reason: String?) -> String {
     }
 }
 
+private func atlasSearchRanges(of query: String, in text: String) -> [Range<String.Index>] {
+    let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !needle.isEmpty, !text.isEmpty else { return [] }
+    var ranges: [Range<String.Index>] = []
+    var searchStart = text.startIndex
+    while searchStart < text.endIndex,
+          let range = text.range(
+              of: needle,
+              options: [.caseInsensitive, .diacriticInsensitive],
+              range: searchStart..<text.endIndex
+          ) {
+        ranges.append(range)
+        searchStart = range.upperBound
+    }
+    return ranges
+}
+
+private struct ChatSearchResult: Hashable {
+    let messageID: Int
+    let occurrence: Int
+}
+
 struct ChatSummary: Decodable, Identifiable, Hashable {
     let id: String
     let codex_thread_id: String?
@@ -227,6 +250,13 @@ private struct ChatBottomPreferenceKey: PreferenceKey {
     }
 }
 
+private struct ComposerTextHeightPreferenceKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
 private struct ChatScrollIntentMonitor: NSViewRepresentable {
     let onUserScroll: () -> Void
 
@@ -320,6 +350,9 @@ final class AtlasModel: ObservableObject {
     @Published var sentiment: SentimentStatus?
     @Published var suggestions: [String] = []
     @Published var suggestionsRefreshing = false
+    @Published private(set) var completedSuggestions = Set(
+        UserDefaults.standard.stringArray(forKey: "atlas.suggestions.completed") ?? []
+    )
     @Published var firstInsightsReadyBanner = false
     @Published var error: String?
     let calendar = AtlasCalendarBridge()
@@ -527,6 +560,14 @@ final class AtlasModel: ObservableObject {
         suggestionsRefreshing = false
     }
 
+    func markSuggestionCompleted(_ suggestion: String) {
+        completedSuggestions.insert(suggestion)
+        UserDefaults.standard.set(
+            Array(completedSuggestions),
+            forKey: "atlas.suggestions.completed"
+        )
+    }
+
     func loadChat(_ id: String) async {
         do {
             selectedChat = try await request(path: "api/chats/\(id)")
@@ -662,10 +703,12 @@ final class AtlasModel: ObservableObject {
         }
     }
 
-    func send(responseProfile: String) async {
+    @discardableResult
+    func send(responseProfile: String) async -> Bool {
         let message = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !message.isEmpty, !isSending else { return }
+        guard !message.isEmpty, !isSending else { return false }
         let profile = responseProfile == "faster" ? "faster" : "deeper"
+        var completed = false
         isSending = true
         if case .chat(let id) = selection { sendingChatID = id }
         chatActivity = ChatActivity(
@@ -700,7 +743,7 @@ final class AtlasModel: ObservableObject {
                 selection = .chat(chat.id)
             }
             await loadChats()
-            await monitorChat(chat.id)
+            completed = await monitorChat(chat.id)
         } catch {
             prompt = message
             self.error = error.localizedDescription
@@ -712,6 +755,7 @@ final class AtlasModel: ObservableObject {
                 chatActivity = nil
             }
         }
+        return completed
     }
 
     func stopSending() async {
@@ -748,11 +792,11 @@ final class AtlasModel: ObservableObject {
         }
     }
 
-    private func monitorChat(_ id: String) async {
+    private func monitorChat(_ id: String) async -> Bool {
         while !Task.isCancelled {
-            guard isSending, sendingChatID == id else { return }
+            guard isSending, sendingChatID == id else { return false }
             try? await Task.sleep(for: .milliseconds(160))
-            guard isSending, sendingChatID == id else { return }
+            guard isSending, sendingChatID == id else { return false }
             do {
                 let activity: ChatActivity = try await request(path: "api/chats/\(id)/activity")
                 withAnimation(.smooth(duration: 0.18)) { chatActivity = activity }
@@ -770,14 +814,15 @@ final class AtlasModel: ObservableObject {
                     }
                     await loadChats()
                     if activity.status == "error" { error = activity.detail }
-                    return
+                    return activity.status == "complete"
                 }
             } catch {
-                guard isSending, sendingChatID == id else { return }
+                guard isSending, sendingChatID == id else { return false }
                 self.error = "Atlas lost contact with its local service."
-                return
+                return false
             }
         }
+        return false
     }
 
     private struct RefreshResponse: Decodable { let status: String }
@@ -825,6 +870,11 @@ struct AtlasView: View {
     @State private var showSettings = false
     @State private var chatIsNearBottom = true
     @State private var hoveredSuggestion: String?
+    @State private var composerTextHeight: CGFloat = 0
+    @State private var chatSearchPresented = false
+    @State private var chatSearchQuery = ""
+    @State private var chatSearchResultIndex = 0
+    @FocusState private var chatSearchFocused: Bool
     @Namespace private var reasoningToggleAnimation
 
     private var accent: Color {
@@ -929,6 +979,10 @@ struct AtlasView: View {
         .onReceive(NotificationCenter.default.publisher(for: .atlasOpenSettings)) { _ in
             guard model.lockState == .unlocked else { return }
             withAnimation(.smooth(duration: 0.24)) { showSettings = true }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .atlasFindInChat)) { _ in
+            guard model.lockState == .unlocked, model.selectedChat != nil else { return }
+            openChatSearch()
         }
         .onChange(of: scenePhase) { _, phase in
             if onboardingVersion >= currentOnboardingVersion && touchIDEnabled && phase != .active { model.lock() }
@@ -1351,7 +1405,8 @@ struct AtlasView: View {
                         systemImage: "sparkles",
                         description: Text("Atlas will build a careful longitudinal read from your local message history.")
                     )
-                    .frame(minHeight: 320)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity, minHeight: 320, alignment: .center)
                 }
 
             }
@@ -1660,6 +1715,14 @@ struct AtlasView: View {
                 }
                 Spacer()
                 reasoningToggle
+                Button {
+                    chatSearchPresented ? closeChatSearch() : openChatSearch()
+                } label: {
+                    Image(systemName: chatSearchPresented ? "magnifyingglass.circle.fill" : "magnifyingglass")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(chatSearchPresented ? accent : Color.secondary)
+                .help("Search this conversation (⌘F)")
                 if let chat = model.selectedChat {
                     Button {
                         chatPendingDeletion = model.chats.first(where: { $0.id == chat.id })
@@ -1673,12 +1736,25 @@ struct AtlasView: View {
             }
             .padding(.horizontal, 28).padding(.vertical, 18)
             Divider()
+            if chatSearchPresented {
+                chatSearchBar
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                Divider()
+            }
             GeometryReader { viewport in
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(spacing: 20) {
                             ForEach(model.selectedChat?.messages ?? []) { message in
-                                messageRow(message)
+                                let selectedResult = selectedChatSearchResult
+                                messageRow(
+                                    message,
+                                    searchQuery: chatSearchQuery,
+                                    isSearchMatch: chatSearchResults.contains { $0.messageID == message.id },
+                                    selectedSearchOccurrence: selectedResult?.messageID == message.id
+                                        ? selectedResult?.occurrence
+                                        : nil
+                                )
                                     .id(message.id)
                                     .transition(.asymmetric(
                                         insertion: .move(edge: .bottom).combined(with: .opacity),
@@ -1723,6 +1799,14 @@ struct AtlasView: View {
                     }
                     .onChange(of: model.selection) { _, _ in
                         chatIsNearBottom = true
+                        closeChatSearch(animated: false)
+                    }
+                    .onChange(of: selectedChatSearchResult) { _, result in
+                        guard let result else { return }
+                        chatIsNearBottom = false
+                        withAnimation(.smooth(duration: 0.28)) {
+                            proxy.scrollTo(result.messageID, anchor: .center)
+                        }
                     }
                     .onChange(of: model.selectedChat?.messages.count) { _, _ in
                         guard chatIsNearBottom else { return }
@@ -1748,8 +1832,14 @@ struct AtlasView: View {
         }
     }
 
-    private func messageRow(_ message: ChatMessage) -> some View {
+    private func messageRow(
+        _ message: ChatMessage,
+        searchQuery: String,
+        isSearchMatch: Bool,
+        selectedSearchOccurrence: Int?
+    ) -> some View {
         let isOutgoing = message.role == "user"
+        let isSelectedSearchResult = selectedSearchOccurrence != nil
         return HStack {
             if isOutgoing { Spacer(minLength: 90) }
             VStack(alignment: .leading, spacing: 7) {
@@ -1760,7 +1850,14 @@ struct AtlasView: View {
                         messagesReadBadge(count)
                     }
                 }
-                MarkdownText(message.content).textSelection(.enabled).lineSpacing(4)
+                MarkdownText(
+                    message.content,
+                    searchQuery: isSearchMatch ? searchQuery : nil,
+                    selectedSearchOccurrence: selectedSearchOccurrence,
+                    searchTint: accent
+                )
+                .textSelection(.enabled)
+                .lineSpacing(4)
                 if !isOutgoing {
                     HStack {
                         Button {
@@ -1788,6 +1885,113 @@ struct AtlasView: View {
                         in: RoundedRectangle(cornerRadius: 17))
             if !isOutgoing { Spacer(minLength: 56) }
         }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(
+            isSelectedSearchResult
+                ? accent.opacity(0.11)
+                : accent.opacity(isSearchMatch ? 0.045 : 0),
+            in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+        )
+        .overlay {
+            if isSelectedSearchResult {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(accent.opacity(0.50), lineWidth: 1)
+            }
+        }
+        .animation(.smooth(duration: 0.2), value: isSelectedSearchResult)
+    }
+
+    private var chatSearchBar: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+            TextField("Search this conversation", text: $chatSearchQuery)
+                .textFieldStyle(.plain)
+                .focused($chatSearchFocused)
+                .onSubmit { moveChatSearchResult(by: 1) }
+                .onChange(of: chatSearchQuery) { _, _ in
+                    chatSearchResultIndex = 0
+                }
+
+            Text(chatSearchResultLabel)
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .fixedSize()
+
+            Button { moveChatSearchResult(by: -1) } label: {
+                Image(systemName: "chevron.up")
+            }
+            .buttonStyle(.plain)
+            .disabled(chatSearchResults.isEmpty)
+            .help("Previous result")
+
+            Button { moveChatSearchResult(by: 1) } label: {
+                Image(systemName: "chevron.down")
+            }
+            .buttonStyle(.plain)
+            .disabled(chatSearchResults.isEmpty)
+            .help("Next result")
+
+            Button { closeChatSearch() } label: {
+                Image(systemName: "xmark")
+            }
+            .buttonStyle(.plain)
+            .help("Close search")
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(Color.secondary.opacity(0.055))
+        .onExitCommand { closeChatSearch() }
+    }
+
+    private var chatSearchResults: [ChatSearchResult] {
+        let query = chatSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return [] }
+        return (model.selectedChat?.messages ?? []).flatMap { message in
+            atlasSearchRanges(of: query, in: message.content).indices.map { occurrence in
+                ChatSearchResult(messageID: message.id, occurrence: occurrence)
+            }
+        }
+    }
+
+    private var selectedChatSearchResult: ChatSearchResult? {
+        let matches = chatSearchResults
+        guard !matches.isEmpty else { return nil }
+        return matches[min(chatSearchResultIndex, matches.count - 1)]
+    }
+
+    private var chatSearchResultLabel: String {
+        guard !chatSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return ""
+        }
+        let count = chatSearchResults.count
+        guard count > 0 else { return "No results" }
+        return "\(min(chatSearchResultIndex + 1, count)) of \(count)"
+    }
+
+    private func openChatSearch() {
+        withAnimation(.smooth(duration: 0.2)) {
+            chatSearchPresented = true
+        }
+        DispatchQueue.main.async { chatSearchFocused = true }
+    }
+
+    private func closeChatSearch(animated: Bool = true) {
+        if animated {
+            withAnimation(.smooth(duration: 0.18)) { chatSearchPresented = false }
+        } else {
+            chatSearchPresented = false
+        }
+        chatSearchFocused = false
+        chatSearchQuery = ""
+        chatSearchResultIndex = 0
+    }
+
+    private func moveChatSearchResult(by offset: Int) {
+        let count = chatSearchResults.count
+        guard count > 0 else { return }
+        chatSearchResultIndex = (chatSearchResultIndex + offset + count) % count
     }
 
     private func outgoingMessageWidth(_ content: String) -> CGFloat {
@@ -1899,11 +2103,18 @@ struct AtlasView: View {
                 alignment: .leading,
                 spacing: 10
             ) {
-                ForEach(Array(model.suggestions.prefix(2).enumerated()), id: \.element) { index, suggestion in
+                ForEach(Array(visibleSuggestions.prefix(2).enumerated()), id: \.element) { index, suggestion in
                     let isHovered = hoveredSuggestion == suggestion
                     Button {
                         model.prompt = suggestion
-                        Task { await model.send(responseProfile: responseProfile) }
+                        Task {
+                            let completed = await model.send(responseProfile: responseProfile)
+                            guard completed else { return }
+                            withAnimation(.smooth(duration: 0.24)) {
+                                model.markSuggestionCompleted(suggestion)
+                                if hoveredSuggestion == suggestion { hoveredSuggestion = nil }
+                            }
+                        }
                     } label: {
                         HStack(spacing: 9) {
                             Image(systemName: "sparkles")
@@ -1961,13 +2172,45 @@ struct AtlasView: View {
         .frame(maxWidth: 760, alignment: .leading)
     }
 
+    private var visibleSuggestions: [String] {
+        model.suggestions.filter { !model.completedSuggestions.contains($0) }
+    }
+
     private var composer: some View {
         VStack(alignment: .leading, spacing: 12) {
             TextField("Ask Atlas…", text: $model.prompt, axis: .vertical)
                 .textFieldStyle(.plain)
                 .font(.system(size: 18))
                 .lineLimit(compactComposer ? 1...4 : 2...6)
+                .frame(height: effectiveComposerTextHeight, alignment: .topLeading)
                 .padding(.vertical, compactComposer ? 2 : 6)
+                .background(alignment: .topLeading) {
+                    Text(model.prompt.isEmpty ? " " : model.prompt + " ")
+                        .font(.system(size: 18))
+                        .lineLimit(nil)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .hidden()
+                        .background {
+                            GeometryReader { measurement in
+                                Color.clear.preference(
+                                    key: ComposerTextHeightPreferenceKey.self,
+                                    value: measurement.size.height
+                                )
+                            }
+                        }
+                }
+                .onPreferenceChange(ComposerTextHeightPreferenceKey.self) { measuredHeight in
+                    guard measuredHeight > 0 else { return }
+                    let nextHeight = min(
+                        max(measuredHeight, composerMinimumTextHeight),
+                        composerMaximumTextHeight
+                    )
+                    guard abs(nextHeight - composerTextHeight) > 0.5 else { return }
+                    withAnimation(.smooth(duration: 0.22)) {
+                        composerTextHeight = nextHeight
+                    }
+                }
                 .onKeyPress(.return, phases: .down) { keyPress in
                     if keyPress.modifiers.contains(.shift) {
                         return .ignored
@@ -2015,6 +2258,20 @@ struct AtlasView: View {
             )
         )
         .shadow(color: .black.opacity(colorScheme == .dark ? 0.24 : 0.07), radius: 24, y: 8)
+        .animation(.smooth(duration: 0.22), value: compactComposer)
+    }
+
+    private var composerMinimumTextHeight: CGFloat {
+        compactComposer ? 22 : 44
+    }
+
+    private var composerMaximumTextHeight: CGFloat {
+        compactComposer ? 88 : 132
+    }
+
+    private var effectiveComposerTextHeight: CGFloat {
+        guard composerTextHeight > 0 else { return composerMinimumTextHeight }
+        return min(max(composerTextHeight, composerMinimumTextHeight), composerMaximumTextHeight)
     }
 
     private var reasoningToggle: some View {
@@ -2985,33 +3242,47 @@ private struct AtlasOnboardingView: View {
 
 private struct MarkdownText: View {
     let source: String
+    let searchQuery: String?
+    let selectedSearchOccurrence: Int?
+    let searchTint: Color
     @Environment(\.colorScheme) private var colorScheme
-    init(_ source: String) { self.source = source }
+
+    init(
+        _ source: String,
+        searchQuery: String? = nil,
+        selectedSearchOccurrence: Int? = nil,
+        searchTint: Color = .accentColor
+    ) {
+        self.source = source
+        self.searchQuery = searchQuery
+        self.selectedSearchOccurrence = selectedSearchOccurrence
+        self.searchTint = searchTint
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
-                blockView(block)
+            ForEach(Array(blocks.enumerated()), id: \.offset) { index, block in
+                blockView(block, occurrenceOffset: occurrenceOffset(beforeBlockAt: index))
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     @ViewBuilder
-    private func blockView(_ block: Block) -> some View {
+    private func blockView(_ block: Block, occurrenceOffset: Int) -> some View {
         switch block {
         case .heading(let text, let level):
-            inlineText(text)
+            inlineText(text, occurrenceOffset: occurrenceOffset)
                 .font(level == 1 ? .title2.weight(.semibold) : .headline)
                 .padding(.top, level == 1 ? 4 : 2)
         case .paragraph(let text):
-            inlineText(text)
+            inlineText(text, occurrenceOffset: occurrenceOffset)
         case .bullet(let text):
             HStack(alignment: .firstTextBaseline, spacing: 10) {
                 Circle()
                     .fill(Color.secondary.opacity(0.75))
                     .frame(width: 5, height: 5)
-                inlineText(text)
+                inlineText(text, occurrenceOffset: occurrenceOffset)
             }
             .padding(.leading, 3)
         case .numbered(let marker, let text):
@@ -3020,12 +3291,130 @@ private struct MarkdownText: View {
                     .font(.callout.monospacedDigit().weight(.semibold))
                     .foregroundStyle(.secondary)
                     .frame(minWidth: 20, alignment: .trailing)
-                inlineText(text)
+                inlineText(text, occurrenceOffset: occurrenceOffset)
             }
+        case .table(let headers, let alignments, let rows):
+            tableView(
+                headers: headers,
+                alignments: alignments,
+                rows: rows,
+                occurrenceOffset: occurrenceOffset
+            )
         }
     }
 
-    private func inlineText(_ value: String) -> Text {
+    private func tableView(
+        headers: [String],
+        alignments: [MarkdownTableAlignment],
+        rows: [[String]],
+        occurrenceOffset: Int
+    ) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            Grid(alignment: .leading, horizontalSpacing: 0, verticalSpacing: 0) {
+                GridRow {
+                    ForEach(headers.indices, id: \.self) { column in
+                        tableCell(
+                            headers[column],
+                            alignment: alignments[column],
+                            isHeader: true,
+                            shade: true,
+                            isTopRow: true,
+                            isBottomRow: rows.isEmpty,
+                            isFirstColumn: column == headers.startIndex,
+                            isLastColumn: column == headers.index(before: headers.endIndex),
+                            occurrenceOffset: tableCellOccurrenceOffset(
+                                headers: headers,
+                                rows: rows,
+                                rowIndex: nil,
+                                column: column,
+                                base: occurrenceOffset
+                            )
+                        )
+                    }
+                }
+
+                ForEach(Array(rows.enumerated()), id: \.offset) { rowIndex, row in
+                    Divider().gridCellUnsizedAxes(.horizontal)
+                    GridRow {
+                        ForEach(headers.indices, id: \.self) { column in
+                            tableCell(
+                                row[column],
+                                alignment: alignments[column],
+                                isHeader: false,
+                                shade: rowIndex.isMultiple(of: 2) == false,
+                                isTopRow: false,
+                                isBottomRow: rowIndex == rows.index(before: rows.endIndex),
+                                isFirstColumn: column == headers.startIndex,
+                                isLastColumn: column == headers.index(before: headers.endIndex),
+                                occurrenceOffset: tableCellOccurrenceOffset(
+                                    headers: headers,
+                                    rows: rows,
+                                    rowIndex: rowIndex,
+                                    column: column,
+                                    base: occurrenceOffset
+                                )
+                            )
+                        }
+                    }
+                }
+            }
+            .background(Color.secondary.opacity(colorScheme == .dark ? 0.055 : 0.035))
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(Color.secondary.opacity(0.18), lineWidth: 1)
+            }
+        }
+        .scrollClipDisabled()
+    }
+
+    private func tableCell(
+        _ value: String,
+        alignment: MarkdownTableAlignment,
+        isHeader: Bool,
+        shade: Bool,
+        isTopRow: Bool,
+        isBottomRow: Bool,
+        isFirstColumn: Bool,
+        isLastColumn: Bool,
+        occurrenceOffset: Int
+    ) -> some View {
+        inlineText(value, occurrenceOffset: occurrenceOffset)
+            .font(isHeader ? .callout.weight(.semibold) : .callout)
+            .multilineTextAlignment(alignment.textAlignment)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(
+                minWidth: 110,
+                maxWidth: 260,
+                minHeight: isHeader ? 40 : 38,
+                alignment: alignment.frameAlignment
+            )
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .background(
+                isHeader
+                    ? Color.secondary.opacity(colorScheme == .dark ? 0.13 : 0.09)
+                    : Color.secondary.opacity(shade ? 0.045 : 0),
+                in: UnevenRoundedRectangle(
+                    cornerRadii: .init(
+                        topLeading: isTopRow && isFirstColumn ? 9 : 0,
+                        bottomLeading: isBottomRow && isFirstColumn ? 9 : 0,
+                        bottomTrailing: isBottomRow && isLastColumn ? 9 : 0,
+                        topTrailing: isTopRow && isLastColumn ? 9 : 0
+                    ),
+                    style: .continuous
+                )
+            )
+            .overlay(alignment: .trailing) {
+                if !isLastColumn {
+                    Rectangle()
+                        .fill(Color.secondary.opacity(0.12))
+                        .frame(width: 1)
+                }
+            }
+    }
+
+    private func inlineText(_ value: String, occurrenceOffset: Int) -> Text {
         let parts = value.components(separatedBy: "==")
         var combined = AttributedString()
         for (index, part) in parts.enumerated() {
@@ -3048,12 +3437,82 @@ private struct MarkdownText: View {
             }
             combined.append(attributed)
         }
+
+        if let searchQuery {
+            let visibleText = String(combined.characters)
+            for (localOccurrence, range) in atlasSearchRanges(of: searchQuery, in: visibleText).enumerated() {
+                guard let lower = AttributedString.Index(range.lowerBound, within: combined),
+                      let upper = AttributedString.Index(range.upperBound, within: combined) else { continue }
+                let isSelected = occurrenceOffset + localOccurrence == selectedSearchOccurrence
+                combined[lower..<upper].backgroundColor = searchTint.opacity(
+                    isSelected
+                        ? (colorScheme == .dark ? 0.48 : 0.34)
+                        : (colorScheme == .dark ? 0.22 : 0.16)
+                )
+                if isSelected {
+                    combined[lower..<upper].foregroundColor = colorScheme == .dark
+                        ? Color.white
+                        : Color.primary
+                }
+            }
+        }
         return Text(combined)
+    }
+
+    private func occurrenceCount(in text: String) -> Int {
+        guard let searchQuery else { return 0 }
+        return atlasSearchRanges(of: searchQuery, in: text).count
+    }
+
+    private func occurrenceCount(in block: Block) -> Int {
+        switch block {
+        case .heading(let text, _), .paragraph(let text), .bullet(let text):
+            return occurrenceCount(in: text)
+        case .numbered(_, let text):
+            return occurrenceCount(in: text)
+        case .table(let headers, _, let rows):
+            return (headers + rows.flatMap { $0 }).reduce(0) { count, cell in
+                count + occurrenceCount(in: cell)
+            }
+        }
+    }
+
+    private func occurrenceOffset(beforeBlockAt index: Int) -> Int {
+        blocks.prefix(index).reduce(0) { count, block in
+            count + occurrenceCount(in: block)
+        }
+    }
+
+    private func tableCellOccurrenceOffset(
+        headers: [String],
+        rows: [[String]],
+        rowIndex: Int?,
+        column: Int,
+        base: Int
+    ) -> Int {
+        var offset = base
+        if let rowIndex {
+            offset += headers.reduce(0) { $0 + occurrenceCount(in: $1) }
+            offset += rows.prefix(rowIndex).flatMap { $0 }.reduce(0) {
+                $0 + occurrenceCount(in: $1)
+            }
+            offset += rows[rowIndex].prefix(column).reduce(0) {
+                $0 + occurrenceCount(in: $1)
+            }
+        } else {
+            offset += headers.prefix(column).reduce(0) {
+                $0 + occurrenceCount(in: $1)
+            }
+        }
+        return offset
     }
 
     private var blocks: [Block] {
         var result: [Block] = []
         var paragraph: [String] = []
+        let lines = displaySource.replacingOccurrences(of: "\r\n", with: "\n")
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { String($0).trimmingCharacters(in: .whitespaces) }
 
         func flushParagraph() {
             guard !paragraph.isEmpty else { return }
@@ -3061,15 +3520,32 @@ private struct MarkdownText: View {
             paragraph.removeAll(keepingCapacity: true)
         }
 
-        for rawLine in displaySource.replacingOccurrences(of: "\r\n", with: "\n")
-            .split(separator: "\n", omittingEmptySubsequences: false) {
-            let line = rawLine.trimmingCharacters(in: .whitespaces)
+        var lineIndex = 0
+        while lineIndex < lines.count {
+            let line = lines[lineIndex]
             if line.isEmpty {
                 flushParagraph()
+                lineIndex += 1
                 continue
             }
 
-            if line.hasPrefix("### ") {
+            if lineIndex + 1 < lines.count,
+               let headers = tableCells(in: line),
+               headers.count >= 2,
+               let alignments = tableAlignments(in: lines[lineIndex + 1]),
+               alignments.count == headers.count {
+                flushParagraph()
+                var rows: [[String]] = []
+                lineIndex += 2
+                while lineIndex < lines.count,
+                      !lines[lineIndex].isEmpty,
+                      let cells = tableCells(in: lines[lineIndex]) {
+                    rows.append(normalizeTableRow(cells, columnCount: headers.count))
+                    lineIndex += 1
+                }
+                result.append(.table(headers, alignments, rows))
+                continue
+            } else if line.hasPrefix("### ") {
                 flushParagraph()
                 result.append(.heading(String(line.dropFirst(4)), 3))
             } else if line.hasPrefix("## ") {
@@ -3087,9 +3563,57 @@ private struct MarkdownText: View {
             } else {
                 paragraph.append(line)
             }
+            lineIndex += 1
         }
         flushParagraph()
         return result
+    }
+
+    private func tableCells(in line: String) -> [String]? {
+        var content = line.trimmingCharacters(in: .whitespaces)
+        guard content.contains("|") else { return nil }
+        if content.first == "|" { content.removeFirst() }
+        if content.last == "|" { content.removeLast() }
+
+        var cells: [String] = []
+        var current = ""
+        var escaped = false
+        for character in content {
+            if escaped {
+                current.append(character)
+                escaped = false
+            } else if character == "\\" {
+                escaped = true
+            } else if character == "|" {
+                cells.append(current.trimmingCharacters(in: .whitespaces))
+                current = ""
+            } else {
+                current.append(character)
+            }
+        }
+        if escaped { current.append("\\") }
+        cells.append(current.trimmingCharacters(in: .whitespaces))
+        return cells.count >= 2 ? cells : nil
+    }
+
+    private func tableAlignments(in line: String) -> [MarkdownTableAlignment]? {
+        guard let cells = tableCells(in: line) else { return nil }
+        var alignments: [MarkdownTableAlignment] = []
+        for cell in cells {
+            let marker = cell.trimmingCharacters(in: .whitespaces)
+            let centered = marker.hasPrefix(":") && marker.hasSuffix(":")
+            let trailing = !centered && marker.hasSuffix(":")
+            let rule = marker.trimmingCharacters(in: CharacterSet(charactersIn: ":"))
+            guard rule.count >= 3, rule.allSatisfy({ $0 == "-" }) else { return nil }
+            alignments.append(centered ? .center : trailing ? .trailing : .leading)
+        }
+        return alignments
+    }
+
+    private func normalizeTableRow(_ cells: [String], columnCount: Int) -> [String] {
+        (0..<columnCount).map { column in
+            column < cells.count ? cells[column] : ""
+        }
     }
 
     private var displaySource: String {
@@ -3118,6 +3642,29 @@ private struct MarkdownText: View {
         case paragraph(String)
         case bullet(String)
         case numbered(String, String)
+        case table([String], [MarkdownTableAlignment], [[String]])
+    }
+
+    private enum MarkdownTableAlignment {
+        case leading
+        case center
+        case trailing
+
+        var frameAlignment: Alignment {
+            switch self {
+            case .leading: return .leading
+            case .center: return .center
+            case .trailing: return .trailing
+            }
+        }
+
+        var textAlignment: TextAlignment {
+            switch self {
+            case .leading: return .leading
+            case .center: return .center
+            case .trailing: return .trailing
+            }
+        }
     }
 }
 
@@ -3176,6 +3723,12 @@ struct AtlasApp: App {
                         NotificationCenter.default.post(name: .atlasOpenSettings, object: nil)
                     }
                     .keyboardShortcut(",", modifiers: .command)
+                }
+                CommandGroup(after: .textEditing) {
+                    Button("Find in Conversation") {
+                        NotificationCenter.default.post(name: .atlasFindInChat, object: nil)
+                    }
+                    .keyboardShortcut("f", modifiers: .command)
                 }
             }
     }
