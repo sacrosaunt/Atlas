@@ -184,9 +184,13 @@ Use neutral language and never refer to anyone as "the user".
 const STARTER_SUGGESTIONS = [
   "What pattern in my closest conversations am I missing?",
   "Which recent relationship has changed most—and how?",
+  "Where has my communication become noticeably warmer?",
+  "Who brings out a side of me that others rarely see?",
+  "Which connection has become more reciprocal over time?",
+  "What recent exchange deserves a closer second look?",
 ];
 const SUGGESTION_REFRESH_INTERVAL_MS = 60 * 60 * 1_000;
-const SUGGESTION_PROMPT_VERSION = 4;
+const SUGGESTION_PROMPT_VERSION = 5;
 
 const SUGGESTION_SCHEMA = {
   type: "object",
@@ -195,29 +199,29 @@ const SUGGESTION_SCHEMA = {
   properties: {
     suggestions: {
       type: "array",
-      minItems: 2,
-      maxItems: 2,
+      minItems: 6,
+      maxItems: 6,
       items: { type: "string", minLength: 12, maxLength: 68 },
     },
   },
 };
 
 const SUGGESTION_INSTRUCTIONS = `
-Create exactly two unusually compelling starter questions for Atlas from the
+Create exactly six unusually compelling starter questions for Atlas from the
 bounded recent message excerpts provided. Do not call tools. Let the direction
 of each question emerge entirely from the messages. Give equal consideration
 to warmth, humor, support, reciprocity, growth, shared interests, changing
 closeness, stable strengths, ambiguity, and genuine friction. Choose the
 strongest and most interesting signals actually present, regardless of
 emotional valence.
-Both questions must be specific and worth deeper investigation; at least one
+Every question must be specific and worth deeper investigation; at least three
 must name a person. Avoid generic prompts such as "How do I communicate?",
 "Tell me about me", or "What could I explore?" Do not reveal a conclusion as
 established fact or quote private messages—the chip should invite Atlas to test
 an intriguing observation or hypothesis. Favor nuance: allow for mixed,
 changing, uncertain, or context-dependent evidence, and do not reduce a person
-or relationship to one trait. Make the two questions diverse in subject, lens,
-or time scale—not merely different phrasings of the same idea. Write in first
+or relationship to one trait. Make the questions diverse in subject, lens, and
+time scale—not merely different phrasings of the same idea. Write in first
 person using "me" or "my", never "the user". Never mention identifiers, phone
 numbers, email addresses, models, excerpts, or archives. Keep each question
 natural and at most 68 characters. Make them meaningfully different from
@@ -228,7 +232,7 @@ function loadStarterSuggestionsCache() {
   try {
     const cached = JSON.parse(readFileSync(starterSuggestionsCachePath, "utf8"));
     if (cached.prompt_version !== SUGGESTION_PROMPT_VERSION) return;
-    if (!Array.isArray(cached.suggestions) || cached.suggestions.length !== 2) return;
+    if (!Array.isArray(cached.suggestions) || cached.suggestions.length !== 6) return;
     if (!cached.suggestions.every((suggestion) => typeof suggestion === "string"
       && suggestion.length >= 12 && suggestion.length <= 68)) return;
     const generatedAt = Date.parse(cached.generated_at);
@@ -461,7 +465,7 @@ function refreshStarterSuggestions() {
     });
     const result = await createCodexConversation({
       prompt: [
-        "Choose two insightful, specific questions grounded in the strongest signals present, whatever their direction or tone.",
+        "Choose six insightful, specific questions grounded in the strongest signals present, whatever their direction or tone.",
         JSON.stringify({
           previous_suggestions: starterSuggestions ?? [],
           recent_conversation_excerpts: conversationExcerpts,
@@ -479,8 +483,8 @@ function refreshStarterSuggestions() {
     const generated = JSON.parse(result.response).suggestions
       .map((suggestion) => suggestion.replace(/\s+/g, " ").trim())
       .filter(Boolean);
-    starterSuggestions = [...new Set(generated)].slice(0, 2);
-    if (starterSuggestions.length < 2) starterSuggestions = STARTER_SUGGESTIONS;
+    starterSuggestions = [...new Set(generated)].slice(0, 6);
+    if (starterSuggestions.length < 6) starterSuggestions = STARTER_SUGGESTIONS;
     starterSuggestionsGeneratedAt = Date.now();
     saveStarterSuggestionsCache();
   })()

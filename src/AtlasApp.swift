@@ -267,13 +267,7 @@ struct InsightEvidenceContext: Equatable {
     let category: String
     let theme: String
     let evidence: String
-}
-
-private struct ChatBottomPreferenceKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = nextValue()
-    }
+    let tonePoints: [ToneTrendPoint]?
 }
 
 private struct ComposerTextHeightPreferenceKey: PreferenceKey {
@@ -289,6 +283,7 @@ private struct ChatScrollIntentMonitor: NSViewRepresentable {
     final class Coordinator {
         var onUserScroll: () -> Void
         private var observer: NSObjectProtocol?
+        private var eventMonitor: Any?
         private var retryWorkItem: DispatchWorkItem?
         private var retryCount = 0
 
@@ -313,6 +308,7 @@ private struct ChatScrollIntentMonitor: NSViewRepresentable {
             retryWorkItem?.cancel()
             retryWorkItem = nil
             retryCount = 0
+            scrollView.verticalScrollElasticity = .none
             observer = NotificationCenter.default.addObserver(
                 forName: NSScrollView.willStartLiveScrollNotification,
                 object: scrollView,
@@ -320,11 +316,21 @@ private struct ChatScrollIntentMonitor: NSViewRepresentable {
             ) { [weak self] _ in
                 self?.onUserScroll()
             }
+            eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) {
+                [weak self, weak scrollView] event in
+                guard let scrollView, event.window === scrollView.window else { return event }
+                let location = scrollView.convert(event.locationInWindow, from: nil)
+                if scrollView.bounds.contains(location) {
+                    self?.onUserScroll()
+                }
+                return event
+            }
         }
 
         deinit {
             retryWorkItem?.cancel()
             if let observer { NotificationCenter.default.removeObserver(observer) }
+            if let eventMonitor { NSEvent.removeMonitor(eventMonitor) }
         }
     }
 
@@ -358,6 +364,7 @@ final class AtlasModel: ObservableObject {
     @Published var selection: SidebarSelection? = .insights
     @Published var selectedChat: ChatDetail?
     @Published var insights: InsightSnapshot?
+    @Published var insightsLoading = true
     @Published var prompt = ""
     @Published var isSending = false
     @Published var sendingChatID: String?
@@ -631,8 +638,21 @@ final class AtlasModel: ObservableObject {
 
     func loadInsights() async {
         guard lockState == .unlocked else { return }
+        insightsLoading = true
+        defer { insightsLoading = false }
         do {
-            let snapshot: InsightSnapshot = try await request(path: "api/insights")
+            let snapshot: InsightSnapshot
+            if toneTrends == nil {
+                async let snapshotRequest: InsightSnapshot = request(path: "api/insights")
+                async let trendsRequest: ToneTrendsResponse? = fetchToneTrends()
+                snapshot = try await snapshotRequest
+                if let trends = await trendsRequest {
+                    toneTrends = trends
+                    updateToneTrendCheckpoint()
+                }
+            } else {
+                snapshot = try await request(path: "api/insights")
+            }
             insights = snapshot
             observeFirstInsight(status: snapshot.status, hasDocument: snapshot.document != nil)
         } catch {
@@ -729,7 +749,7 @@ final class AtlasModel: ObservableObject {
                     || analyzedUnits - toneTrendAnalyzedUnits >= 5_000
                     || (status.phase == "ready" && analyzedUnits != toneTrendAnalyzedUnits)
             )
-            if shouldLoadTrends {
+            if shouldLoadTrends && !insightsLoading {
                 await loadToneTrends()
             }
         } catch {
@@ -738,13 +758,19 @@ final class AtlasModel: ObservableObject {
     }
 
     func loadToneTrends() async {
-        do {
-            toneTrends = try await request(path: "api/sentiment/trends")
-            if let sentiment {
-                toneTrendAnalyzedUnits = sentiment.analyzed_turns + sentiment.analyzed_windows
-            }
-        } catch {
-            // Trends appear when enough local tone analysis is available.
+        if let trends = await fetchToneTrends() {
+            toneTrends = trends
+            updateToneTrendCheckpoint()
+        }
+    }
+
+    private func fetchToneTrends() async -> ToneTrendsResponse? {
+        try? await request(path: "api/sentiment/trends")
+    }
+
+    private func updateToneTrendCheckpoint() {
+        if let sentiment {
+            toneTrendAnalyzedUnits = sentiment.analyzed_turns + sentiment.analyzed_windows
         }
     }
 
@@ -757,6 +783,21 @@ final class AtlasModel: ObservableObject {
     }
 
     func exploreInsight(theme: InsightTheme, evidence: String) {
+        exploreEvidence(
+            id: theme.id,
+            category: theme.category,
+            title: theme.title,
+            evidence: evidence
+        )
+    }
+
+    func exploreEvidence(
+        id: String,
+        category: String,
+        title: String,
+        evidence: String,
+        tonePoints: [ToneTrendPoint]? = nil
+    ) {
         guard !isSending else { return }
         selection = nil
         selectedChat = nil
@@ -764,10 +805,11 @@ final class AtlasModel: ObservableObject {
         error = nil
         prompt = ""
         insightEvidenceContext = InsightEvidenceContext(
-            themeID: theme.id,
-            category: theme.category,
-            theme: theme.title,
-            evidence: evidence
+            themeID: id,
+            category: category,
+            theme: title,
+            evidence: evidence,
+            tonePoints: tonePoints
         )
     }
 
@@ -958,7 +1000,7 @@ struct AtlasView: View {
     @State private var chatPendingDeletion: ChatSummary?
     @State private var copiedMessageID: Int?
     @State private var showSettings = false
-    @State private var chatIsNearBottom = true
+    @State private var chatFollowsLiveOutput = true
     @State private var hoveredSuggestion: String?
     @State private var composerTextHeight: CGFloat = 0
     @State private var chatSearchPresented = false
@@ -1444,7 +1486,21 @@ struct AtlasView: View {
                     }
                 }
 
-                if model.insights?.status == "refreshing" {
+                if model.insightsLoading && model.insights?.document == nil {
+                    HStack(spacing: 12) {
+                        ProgressView()
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Loading insights…")
+                                .font(.callout.weight(.medium))
+                            Text("Opening your saved insight snapshot.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(16)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+                } else if model.insights?.status == "refreshing" {
                     HStack(spacing: 12) {
                         ProgressView()
                         VStack(alignment: .leading, spacing: 3) {
@@ -1493,7 +1549,7 @@ struct AtlasView: View {
                     }
                     .padding(22).frame(maxWidth: .infinity, alignment: .leading)
                     .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 20))
-                } else if model.insights?.status != "refreshing" {
+                } else if !model.insightsLoading && model.insights?.status != "refreshing" {
                     ContentUnavailableView(
                         "No insights yet",
                         systemImage: "sparkles",
@@ -1521,16 +1577,29 @@ struct AtlasView: View {
                                 .font(.callout)
                                 .foregroundStyle(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)
+                            Label("Click a point to explore that period", systemImage: "cursorarrow.click.2")
+                                .font(.caption)
+                                .foregroundStyle(accent)
                         }
                         Spacer(minLength: 12)
-                        Picker("Range", selection: $toneTrendRange) {
-                            ForEach(ToneTrendRange.allCases) { range in
-                                Text(range.rawValue).tag(range)
+                        VStack(alignment: .trailing, spacing: 9) {
+                            Picker("Range", selection: $toneTrendRange) {
+                                ForEach(ToneTrendRange.allCases) { range in
+                                    Text(range.rawValue).tag(range)
+                                }
                             }
+                            .pickerStyle(.segmented)
+                            .labelsHidden()
+                            .frame(width: 170)
+                            Button {
+                                exploreToneChart(points)
+                            } label: {
+                                Label("Explore full chart", systemImage: "bubble.left.and.text.bubble.right")
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .disabled(model.isSending)
                         }
-                        .pickerStyle(.segmented)
-                        .labelsHidden()
-                        .frame(width: 170)
                     }
 
                     toneLineChart(points)
@@ -1543,13 +1612,7 @@ struct AtlasView: View {
                         toneMixChart(points)
                     }
 
-                    HStack(spacing: 8) {
-                        Text("\(Int(trends.coverage_percent.rounded(.down)))% of local tone analysis complete")
-                        if points.last?.partial == true {
-                            Text("·")
-                            Text("Latest period is still in progress")
-                        }
-                    }
+                    Text("\(Int(trends.coverage_percent.rounded(.down)))% of local tone analysis complete")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 }
@@ -1605,6 +1668,11 @@ struct AtlasView: View {
                 }
             }
             .chartLegend(.hidden)
+            .chartOverlay { proxy in
+                GeometryReader { geometry in
+                    toneChartHitArea(proxy: proxy, geometry: geometry, points: points)
+                }
+            }
             .frame(height: 210)
         }
     }
@@ -1646,7 +1714,79 @@ struct AtlasView: View {
             }
         }
         .chartLegend(position: .top, alignment: .leading, spacing: 14)
+        .chartOverlay { proxy in
+            GeometryReader { geometry in
+                toneChartHitArea(proxy: proxy, geometry: geometry, points: points)
+            }
+        }
         .frame(height: 210)
+    }
+
+    private func toneChartHitArea(
+        proxy: ChartProxy,
+        geometry: GeometryProxy,
+        points: [ToneTrendPoint]
+    ) -> some View {
+        Rectangle()
+            .fill(Color.clear)
+            .contentShape(Rectangle())
+            .gesture(
+                SpatialTapGesture().onEnded { gesture in
+                    guard let plotAnchor = proxy.plotFrame else { return }
+                    let plotFrame = geometry[plotAnchor]
+                    guard plotFrame.contains(gesture.location) else { return }
+                    let plotX = gesture.location.x - plotFrame.minX
+                    guard let period: String = proxy.value(atX: plotX),
+                          let point = points.first(where: { $0.period == period }) else { return }
+                    exploreTonePoint(point)
+                }
+            )
+            .help("Click a period to explore the underlying evidence")
+    }
+
+    private func exploreTonePoint(_ point: ToneTrendPoint) {
+        let period = tonePeriodTitle(point.period)
+        let positive = Int((point.positive * 100).rounded())
+        let neutral = Int((point.neutral * 100).rounded())
+        let negative = Int((point.negative * 100).rounded())
+        let partialNote = point.partial ? " This period is still in progress." : ""
+        let evidence = """
+        \(period) has a net tone of \(signedTone(point.net * 100)) across \(point.count.formatted()) locally analyzed message turns. The tone mix is \(positive)% positive, \(neutral)% neutral, and \(negative)% negative.\(partialNote) These are text classifications, not measurements of emotion or intent.
+        """
+        withAnimation(.smooth(duration: 0.3)) {
+            model.exploreEvidence(
+                id: "tone-\(point.period)",
+                category: "tone",
+                title: "Tone in \(period)",
+                evidence: evidence
+            )
+        }
+        DispatchQueue.main.async { composerFocused = true }
+    }
+
+    private func exploreToneChart(_ points: [ToneTrendPoint]) {
+        guard !points.isEmpty else { return }
+        let rangeTitle = toneTrendRange == .recent ? "Recent tone trend" : "Yearly tone trend"
+        let rows = points.map { point in
+            let positive = Int((point.positive * 100).rounded())
+            let neutral = Int((point.neutral * 100).rounded())
+            let negative = Int((point.negative * 100).rounded())
+            return "\(tonePeriodTitle(point.period)): net \(signedTone(point.net * 100)); \(positive)% positive, \(neutral)% neutral, \(negative)% negative; \(point.count.formatted()) turns"
+        }
+        let evidence = ([
+            "The full \(toneTrendRange.rawValue.lowercased()) tone chart is attached below.",
+            "These are local text classifications, not measurements of emotion or intent.",
+        ] + rows).joined(separator: "\n")
+        withAnimation(.smooth(duration: 0.3)) {
+            model.exploreEvidence(
+                id: "tone-chart-\(toneTrendRange.rawValue.lowercased())",
+                category: "tone",
+                title: rangeTitle,
+                evidence: evidence,
+                tonePoints: points
+            )
+        }
+        DispatchQueue.main.async { composerFocused = true }
     }
 
     @AxisContentBuilder
@@ -1675,6 +1815,15 @@ struct AtlasView: View {
         formatter.dateFormat = "yyyy-MM"
         guard let date = formatter.date(from: period) else { return period }
         return date.formatted(.dateTime.month(.abbreviated))
+    }
+
+    private func tonePeriodTitle(_ period: String) -> String {
+        if period.count == 4 { return period }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM"
+        guard let date = formatter.date(from: period) else { return period }
+        return date.formatted(.dateTime.month(.wide).year())
     }
 
     private func signedTone(_ value: Double) -> String {
@@ -2048,10 +2197,10 @@ struct AtlasView: View {
                     .transition(.move(edge: .top).combined(with: .opacity))
                 Divider()
             }
-            GeometryReader { viewport in
+            GeometryReader { _ in
                 ScrollViewReader { proxy in
                     ScrollView {
-                        LazyVStack(spacing: 20) {
+                        VStack(spacing: 20) {
                             ForEach(model.selectedChat?.messages ?? []) { message in
                                 let selectedResult = selectedChatSearchResult
                                 messageRow(
@@ -2083,59 +2232,75 @@ struct AtlasView: View {
                                 .id("thinking")
                             }
                             Color.clear
-                                .frame(height: 1)
+                                .frame(height: 12)
                                 .id("chat-bottom")
-                                .background {
-                                    GeometryReader { marker in
-                                        Color.clear.preference(
-                                            key: ChatBottomPreferenceKey.self,
-                                            value: marker.frame(in: .named("chat-scroll")).maxY
-                                        )
-                                    }
-                                }
                         }
-                        .padding(28)
+                        .padding(.horizontal, 28)
+                        .padding(.top, 28)
                         .animation(.smooth(duration: 0.3), value: model.selectedChat?.messages.count)
                         .background(ChatScrollIntentMonitor {
-                            chatIsNearBottom = false
+                            guard selectedChatIsSending else { return }
+                            if chatFollowsLiveOutput {
+                                chatFollowsLiveOutput = false
+                            }
                         })
                     }
-                    .coordinateSpace(name: "chat-scroll")
-                    .onPreferenceChange(ChatBottomPreferenceKey.self) { bottomY in
-                        chatIsNearBottom = bottomY <= viewport.size.height + 72
-                    }
                     .onChange(of: model.selection) { _, _ in
-                        chatIsNearBottom = true
+                        chatFollowsLiveOutput = true
                         closeChatSearch(animated: false)
                     }
                     .onChange(of: selectedChatSearchResult) { _, result in
                         guard let result else { return }
-                        chatIsNearBottom = false
+                        chatFollowsLiveOutput = false
                         withAnimation(.smooth(duration: 0.28)) {
                             proxy.scrollTo(result.messageID, anchor: .center)
                         }
                     }
                     .onChange(of: model.selectedChat?.messages.count) { _, _ in
-                        guard chatIsNearBottom else { return }
-                        if let id = model.selectedChat?.messages.last?.id {
-                            proxy.scrollTo(id, anchor: .bottom)
-                        }
+                        guard chatFollowsLiveOutput else { return }
+                        proxy.scrollTo("chat-bottom", anchor: .bottom)
                     }
                     .onChange(of: selectedChatIsSending) { _, sending in
                         if sending {
-                            chatIsNearBottom = true
+                            chatFollowsLiveOutput = true
                             withAnimation(.smooth(duration: 0.28)) {
                                 proxy.scrollTo("chat-bottom", anchor: .bottom)
                             }
                         }
                     }
                     .onChange(of: model.chatActivity?.draft?.count) { _, _ in
-                        guard selectedChatIsSending, chatIsNearBottom else { return }
+                        guard selectedChatIsSending, chatFollowsLiveOutput else { return }
                         proxy.scrollTo("chat-bottom", anchor: .bottom)
+                    }
+                    .overlay(alignment: .bottomTrailing) {
+                        if selectedChatIsSending && !chatFollowsLiveOutput {
+                            Button {
+                                withAnimation(.smooth(duration: 0.24)) {
+                                    chatFollowsLiveOutput = true
+                                    proxy.scrollTo("chat-bottom", anchor: .bottom)
+                                }
+                            } label: {
+                                Label("Follow response", systemImage: "arrow.down")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 8)
+                                    .contentShape(Capsule())
+                            }
+                            .buttonStyle(.plain)
+                            .contentShape(Capsule())
+                            .foregroundStyle(accent)
+                            .background(.regularMaterial, in: Capsule())
+                            .overlay(Capsule().stroke(accent.opacity(0.22), lineWidth: 1))
+                            .shadow(color: .black.opacity(0.12), radius: 12, y: 4)
+                            .padding(18)
+                            .transition(.move(edge: .bottom).combined(with: .opacity))
+                        }
                     }
                 }
             }
             composer
+                .padding(.horizontal, 24)
+                .padding(.bottom, 18)
         }
     }
 
@@ -2569,14 +2734,14 @@ struct AtlasView: View {
                             || !composerCanSubmit)
             }
         }
-        .padding(compactComposer ? 12 : 18)
+        .padding(compactComposer ? 18 : 24)
         .background(
             .regularMaterial,
             in: UnevenRoundedRectangle(
                 cornerRadii: .init(
                     topLeading: 20,
-                    bottomLeading: compactComposer ? 0 : 20,
-                    bottomTrailing: compactComposer ? 0 : 20,
+                    bottomLeading: 20,
+                    bottomTrailing: 20,
                     topTrailing: 20
                 ),
                 style: .continuous
@@ -2625,6 +2790,10 @@ struct AtlasView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
                     .fixedSize(horizontal: false, vertical: true)
+                if let points = context.tonePoints, points.count >= 2 {
+                    compactToneEvidenceChart(points)
+                        .padding(.top, 5)
+                }
             }
 
             Spacer(minLength: 8)
@@ -2649,6 +2818,75 @@ struct AtlasView: View {
             RoundedRectangle(cornerRadius: 13, style: .continuous)
                 .stroke(accent.opacity(0.16), lineWidth: 1)
         )
+    }
+
+    private func compactToneEvidenceChart(_ points: [ToneTrendPoint]) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Chart {
+                RuleMark(y: .value("Neutral", 0))
+                    .foregroundStyle(Color.secondary.opacity(0.18))
+                ForEach(points) { point in
+                    LineMark(
+                        x: .value("Period", point.period),
+                        y: .value("Net tone", point.net * 100)
+                    )
+                    .interpolationMethod(.catmullRom)
+                    .lineStyle(StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round))
+                    .foregroundStyle(accent)
+                    PointMark(
+                        x: .value("Period", point.period),
+                        y: .value("Net tone", point.net * 100)
+                    )
+                    .symbolSize(18)
+                    .foregroundStyle(accent)
+                }
+            }
+            .chartXAxis(.hidden)
+            .chartYAxis(.hidden)
+            .chartLegend(.hidden)
+            .frame(height: 54)
+
+            Chart {
+                ForEach(points) { point in
+                    BarMark(
+                        x: .value("Period", point.period),
+                        y: .value("Share", point.positive * 100)
+                    )
+                    .foregroundStyle(by: .value("Tone", "Positive"))
+                    BarMark(
+                        x: .value("Period", point.period),
+                        y: .value("Share", point.neutral * 100)
+                    )
+                    .foregroundStyle(by: .value("Tone", "Neutral"))
+                    BarMark(
+                        x: .value("Period", point.period),
+                        y: .value("Share", point.negative * 100)
+                    )
+                    .foregroundStyle(by: .value("Tone", "Negative"))
+                }
+            }
+            .chartForegroundStyleScale([
+                "Positive": Color(red: 0.22, green: 0.52, blue: 0.91),
+                "Neutral": Color.secondary.opacity(0.55),
+                "Negative": Color(red: 0.92, green: 0.28, blue: 0.31),
+            ])
+            .chartYScale(domain: 0...100)
+            .chartXAxis(.hidden)
+            .chartYAxis(.hidden)
+            .chartLegend(.hidden)
+            .frame(height: 42)
+
+            HStack {
+                Text(tonePeriodTitle(points.first?.period ?? ""))
+                Spacer()
+                Text(tonePeriodTitle(points.last?.period ?? ""))
+            }
+            .font(.system(size: 9).monospacedDigit())
+            .foregroundStyle(.secondary)
+        }
+        .padding(9)
+        .background(Color.secondary.opacity(0.055), in: RoundedRectangle(cornerRadius: 10))
+        .allowsHitTesting(false)
     }
 
     private var composerMinimumTextHeight: CGFloat {
