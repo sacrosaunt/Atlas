@@ -539,7 +539,7 @@ function preserveStoppedDraft(chatId) {
   });
 }
 
-function launchNewChatTurn(prompt, responseProfile = "deeper") {
+function launchNewChatTurn(prompt, responseProfile = "deeper", codexPrompt = prompt) {
   const chat = history.createChat(prompt);
   const controller = new AbortController();
   const active = { controller, completion: null };
@@ -548,7 +548,7 @@ function launchNewChatTurn(prompt, responseProfile = "deeper") {
   const completion = (async () => {
     try {
       const result = await createCodexConversation({
-        ...codexOptions(prompt, (event) => reportChatActivity(chat.id, event), responseProfile),
+        ...codexOptions(codexPrompt, (event) => reportChatActivity(chat.id, event), responseProfile),
         signal: controller.signal,
         onThreadStarted: (threadId) => {
           if (history.getChat(chat.id)) history.attachThread(chat.id, threadId);
@@ -825,6 +825,43 @@ app.get("/api/sentiment/status", (req, res) => {
   res.json(sentimentIndex.status());
 });
 
+app.get("/api/sentiment/trends", (req, res) => {
+  if (!requireApp(req, res)) return;
+  if (!requireConsent(req, res)) return;
+  try {
+    const now = new Date();
+    const recentStart = new Date(Date.UTC(
+      now.getUTCFullYear(),
+      now.getUTCMonth() - 11,
+      1,
+    ));
+    const yearly = sentimentIndex.summary({ bucket: "year" });
+    const recent = sentimentIndex.summary({
+      bucket: "month",
+      since: recentStart.toISOString(),
+    });
+    const currentYear = String(now.getUTCFullYear());
+    const currentMonth = now.toISOString().slice(0, 7);
+    const chartPoints = (rows, currentPeriod) => rows.map((row) => ({
+      period: row.period,
+      count: row.count,
+      positive: row.dominant_share.positive,
+      neutral: row.dominant_share.neutral,
+      negative: row.dominant_share.negative,
+      net: row.average.valence,
+      partial: row.period === currentPeriod,
+    }));
+    res.json({
+      status: yearly.status,
+      coverage_percent: yearly.coverage_percent,
+      yearly: chartPoints(yearly.timeline, currentYear),
+      recent: chartPoints(recent.timeline, currentMonth),
+    });
+  } catch (error) {
+    res.status(503).json({ error: "Local tone trends are not ready yet." });
+  }
+});
+
 app.post("/api/sentiment/enable", async (req, res) => {
   if (!requireApp(req, res)) return;
   try {
@@ -875,7 +912,25 @@ app.post("/api/chats", async (req, res) => {
     res.status(429).json({ error: "Atlas is already running two conversations" });
     return;
   }
-  const { chat, completion } = launchNewChatTurn(prompt, readResponseProfile(req));
+  const insightContext = req.body?.insight_context;
+  const theme = typeof insightContext?.theme === "string"
+    ? insightContext.theme.trim().slice(0, 300)
+    : "";
+  const evidence = typeof insightContext?.evidence === "string"
+    ? insightContext.evidence.trim().slice(0, 2_000)
+    : "";
+  const codexPrompt = theme && evidence ? [
+    "Context selected from Atlas Insights:",
+    `Theme: ${theme}`,
+    `Evidence point: ${evidence}`,
+    "Re-examine this evidence against the underlying messages. Be specific, calibrated, and willing to overturn the earlier reading.",
+    `Question: ${prompt}`,
+  ].join("\n\n") : prompt;
+  const { chat, completion } = launchNewChatTurn(
+    prompt,
+    readResponseProfile(req),
+    codexPrompt,
+  );
   completion.catch(() => {});
   res.status(202).json(chat);
 });

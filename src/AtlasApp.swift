@@ -1,4 +1,5 @@
 import SwiftUI
+import Charts
 import LocalAuthentication
 import AppKit
 import UserNotifications
@@ -109,6 +110,24 @@ struct SentimentStatus: Decodable, Equatable {
     let eta_seconds: Double?
     let model_revision: String
     let error: String?
+}
+
+struct ToneTrendPoint: Decodable, Identifiable, Equatable {
+    var id: String { period }
+    let period: String
+    let count: Int
+    let positive: Double
+    let neutral: Double
+    let negative: Double
+    let net: Double
+    let partial: Bool
+}
+
+struct ToneTrendsResponse: Decodable, Equatable {
+    let status: String
+    let coverage_percent: Double
+    let yearly: [ToneTrendPoint]
+    let recent: [ToneTrendPoint]
 }
 
 private func atlasETAText(_ seconds: Double?) -> String {
@@ -243,6 +262,13 @@ struct InsightTheme: Decodable, Identifiable {
     let why_it_matters: String
 }
 
+struct InsightEvidenceContext: Equatable {
+    let themeID: String
+    let category: String
+    let theme: String
+    let evidence: String
+}
+
 private struct ChatBottomPreferenceKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
@@ -348,6 +374,8 @@ final class AtlasModel: ObservableObject {
     @Published var codexLoginCommand = "codex login"
     @Published var semanticSearch: SemanticSearchStatus?
     @Published var sentiment: SentimentStatus?
+    @Published var toneTrends: ToneTrendsResponse?
+    @Published var insightEvidenceContext: InsightEvidenceContext?
     @Published var suggestions: [String] = []
     @Published var suggestionsRefreshing = false
     @Published private(set) var completedSuggestions = Set(
@@ -359,6 +387,7 @@ final class AtlasModel: ObservableObject {
 
     private var authContext: LAContext?
     private var observedFirstInsightsPending = false
+    private var toneTrendAnalyzedUnits = -1
 
     func unlock() async {
         guard lockState != .unlocking else { return }
@@ -395,6 +424,7 @@ final class AtlasModel: ObservableObject {
         lockState = .locked
         selectedChat = nil
         prompt = ""
+        insightEvidenceContext = nil
         error = nil
     }
 
@@ -510,6 +540,7 @@ final class AtlasModel: ObservableObject {
     func select(_ newSelection: SidebarSelection?) async {
         selection = newSelection
         prompt = ""
+        insightEvidenceContext = nil
         if !isSending { chatActivity = nil }
         error = nil
         switch newSelection {
@@ -523,6 +554,7 @@ final class AtlasModel: ObservableObject {
         selection = nil
         selectedChat = nil
         prompt = ""
+        insightEvidenceContext = nil
         if !isSending { chatActivity = nil }
         error = nil
         Task { await loadSuggestions(refresh: true) }
@@ -689,9 +721,30 @@ final class AtlasModel: ObservableObject {
 
     func loadSentimentStatus() async {
         do {
-            sentiment = try await request(path: "api/sentiment/status")
+            let status: SentimentStatus = try await request(path: "api/sentiment/status")
+            sentiment = status
+            let analyzedUnits = status.analyzed_turns + status.analyzed_windows
+            let shouldLoadTrends = analyzedUnits > 0 && (
+                toneTrends == nil
+                    || analyzedUnits - toneTrendAnalyzedUnits >= 5_000
+                    || (status.phase == "ready" && analyzedUnits != toneTrendAnalyzedUnits)
+            )
+            if shouldLoadTrends {
+                await loadToneTrends()
+            }
         } catch {
             // Tone analysis is additive; keep the rest of Atlas available.
+        }
+    }
+
+    func loadToneTrends() async {
+        do {
+            toneTrends = try await request(path: "api/sentiment/trends")
+            if let sentiment {
+                toneTrendAnalyzedUnits = sentiment.analyzed_turns + sentiment.analyzed_windows
+            }
+        } catch {
+            // Trends appear when enough local tone analysis is available.
         }
     }
 
@@ -703,10 +756,30 @@ final class AtlasModel: ObservableObject {
         }
     }
 
+    func exploreInsight(theme: InsightTheme, evidence: String) {
+        guard !isSending else { return }
+        selection = nil
+        selectedChat = nil
+        chatActivity = nil
+        error = nil
+        prompt = ""
+        insightEvidenceContext = InsightEvidenceContext(
+            themeID: theme.id,
+            category: theme.category,
+            theme: theme.title,
+            evidence: evidence
+        )
+    }
+
+    func dismissInsightContext() {
+        insightEvidenceContext = nil
+    }
+
     @discardableResult
     func send(responseProfile: String) async -> Bool {
         let message = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !message.isEmpty, !isSending else { return false }
+        let attachedInsight = insightEvidenceContext
         let profile = responseProfile == "faster" ? "faster" : "deeper"
         var completed = false
         isSending = true
@@ -730,11 +803,22 @@ final class AtlasModel: ObservableObject {
                     body: ["prompt": message, "response_profile": profile]
                 )
             } else {
+                var body: [String: Any] = [
+                    "prompt": message,
+                    "response_profile": profile,
+                ]
+                if let attachedInsight {
+                    body["insight_context"] = [
+                        "theme": attachedInsight.theme,
+                        "evidence": attachedInsight.evidence,
+                    ]
+                }
                 chat = try await request(
                     path: "api/chats",
                     method: "POST",
-                    body: ["prompt": message, "response_profile": profile]
+                    body: body
                 )
+                insightEvidenceContext = nil
                 selection = .chat(chat.id)
             }
             sendingChatID = chat.id
@@ -858,6 +942,12 @@ final class AtlasModel: ObservableObject {
 }
 
 struct AtlasView: View {
+    private enum ToneTrendRange: String, CaseIterable, Identifiable {
+        case recent = "Recent"
+        case years = "Years"
+        var id: String { rawValue }
+    }
+
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.colorScheme) private var colorScheme
     @StateObject private var model = AtlasModel()
@@ -874,7 +964,10 @@ struct AtlasView: View {
     @State private var chatSearchPresented = false
     @State private var chatSearchQuery = ""
     @State private var chatSearchResultIndex = 0
+    @State private var toneTrendRange: ToneTrendRange = .recent
+    @State private var hoveredEvidencePoint: String?
     @FocusState private var chatSearchFocused: Bool
+    @FocusState private var composerFocused: Bool
     @Namespace private var reasoningToggleAnimation
 
     private var accent: Color {
@@ -1372,6 +1465,7 @@ struct AtlasView: View {
                 if let document = model.insights?.document {
                     insightMetrics(document.metrics, direction: document.direction)
                     coverageCard(document.coverage)
+                    toneTrendsCard
                     evidenceOverview(document.themes)
 
                     VStack(alignment: .leading, spacing: 14) {
@@ -1412,6 +1506,185 @@ struct AtlasView: View {
             }
             .padding(34)
         }
+    }
+
+    @ViewBuilder
+    private var toneTrendsCard: some View {
+        if let trends = model.toneTrends {
+            let points = toneTrendRange == .recent ? trends.recent : trends.yearly
+            if points.count >= 2 {
+                VStack(alignment: .leading, spacing: 22) {
+                    HStack(alignment: .top, spacing: 18) {
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text("Tone over time").font(.headline)
+                            Text("A local estimate of how message wording changes—not a measure of emotion, intent, or relationship quality.")
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Spacer(minLength: 12)
+                        Picker("Range", selection: $toneTrendRange) {
+                            ForEach(ToneTrendRange.allCases) { range in
+                                Text(range.rawValue).tag(range)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .frame(width: 170)
+                    }
+
+                    toneLineChart(points)
+
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("TONE MIX")
+                            .font(.caption2.bold())
+                            .tracking(1)
+                            .foregroundStyle(.secondary)
+                        toneMixChart(points)
+                    }
+
+                    HStack(spacing: 8) {
+                        Text("\(Int(trends.coverage_percent.rounded(.down)))% of local tone analysis complete")
+                        if points.last?.partial == true {
+                            Text("·")
+                            Text("Latest period is still in progress")
+                        }
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+                .padding(22)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+                .animation(.smooth(duration: 0.3), value: toneTrendRange)
+            }
+        }
+    }
+
+    private func toneLineChart(_ points: [ToneTrendPoint]) -> some View {
+        let axisPeriods = toneAxisPeriods(points)
+        return VStack(alignment: .leading, spacing: 9) {
+            HStack {
+                Label("Net tone", systemImage: "chart.xyaxis.line")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if let latest = points.last {
+                    Text("Latest \(signedTone(latest.net * 100))")
+                        .font(.caption.monospacedDigit().weight(.semibold))
+                        .foregroundStyle(toneNetColor(latest.net))
+                }
+            }
+            Chart {
+                RuleMark(y: .value("Neutral", 0))
+                    .foregroundStyle(Color.secondary.opacity(0.22))
+                ForEach(points) { point in
+                    LineMark(
+                        x: .value("Period", point.period),
+                        y: .value("Net tone", point.net * 100)
+                    )
+                    .interpolationMethod(.catmullRom)
+                    .lineStyle(StrokeStyle(lineWidth: 3, lineCap: .round, lineJoin: .round))
+                    .foregroundStyle(accent)
+                    PointMark(
+                        x: .value("Period", point.period),
+                        y: .value("Net tone", point.net * 100)
+                    )
+                    .symbolSize(point.partial ? 42 : 62)
+                    .foregroundStyle(point.partial ? accent.opacity(0.62) : accent)
+                }
+            }
+            .chartXAxis { toneXAxis(axisPeriods) }
+            .chartYAxis {
+                AxisMarks(position: .leading) { value in
+                    AxisGridLine().foregroundStyle(Color.secondary.opacity(0.14))
+                    AxisValueLabel {
+                        if let number = value.as(Double.self) {
+                            Text(signedTone(number))
+                        }
+                    }
+                }
+            }
+            .chartLegend(.hidden)
+            .frame(height: 210)
+        }
+    }
+
+    private func toneMixChart(_ points: [ToneTrendPoint]) -> some View {
+        let axisPeriods = toneAxisPeriods(points)
+        return Chart {
+            ForEach(points) { point in
+                BarMark(
+                    x: .value("Period", point.period),
+                    y: .value("Share", point.positive * 100)
+                )
+                .foregroundStyle(by: .value("Tone", "Positive"))
+                BarMark(
+                    x: .value("Period", point.period),
+                    y: .value("Share", point.neutral * 100)
+                )
+                .foregroundStyle(by: .value("Tone", "Neutral"))
+                BarMark(
+                    x: .value("Period", point.period),
+                    y: .value("Share", point.negative * 100)
+                )
+                .foregroundStyle(by: .value("Tone", "Negative"))
+            }
+        }
+        .chartForegroundStyleScale([
+            "Positive": Color(red: 0.22, green: 0.52, blue: 0.91),
+            "Neutral": Color.secondary.opacity(0.55),
+            "Negative": Color(red: 0.92, green: 0.28, blue: 0.31),
+        ])
+        .chartYScale(domain: 0...100)
+        .chartXAxis { toneXAxis(axisPeriods) }
+        .chartYAxis {
+            AxisMarks(position: .leading, values: [0, 25, 50, 75, 100]) { value in
+                AxisGridLine().foregroundStyle(Color.secondary.opacity(0.14))
+                AxisValueLabel {
+                    if let number = value.as(Int.self) { Text("\(number)%") }
+                }
+            }
+        }
+        .chartLegend(position: .top, alignment: .leading, spacing: 14)
+        .frame(height: 210)
+    }
+
+    @AxisContentBuilder
+    private func toneXAxis(_ periods: [String]) -> some AxisContent {
+        AxisMarks(values: periods) { value in
+            AxisGridLine().foregroundStyle(Color.secondary.opacity(0.10))
+            AxisValueLabel {
+                if let period = value.as(String.self) {
+                    Text(tonePeriodLabel(period))
+                }
+            }
+        }
+    }
+
+    private func toneAxisPeriods(_ points: [ToneTrendPoint]) -> [String] {
+        let stride = points.count > 9 ? 2 : 1
+        return points.enumerated().compactMap { index, point in
+            (index % stride == 0 || index == points.count - 1) ? point.period : nil
+        }
+    }
+
+    private func tonePeriodLabel(_ period: String) -> String {
+        if period.count == 4 { return period }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM"
+        guard let date = formatter.date(from: period) else { return period }
+        return date.formatted(.dateTime.month(.abbreviated))
+    }
+
+    private func signedTone(_ value: Double) -> String {
+        String(format: "%+.0f", value)
+    }
+
+    private func toneNetColor(_ value: Double) -> Color {
+        if value > 0.02 { return Color(red: 0.22, green: 0.52, blue: 0.91) }
+        if value < -0.02 { return Color(red: 0.92, green: 0.28, blue: 0.31) }
+        return .secondary
     }
 
     private func insightMetrics(_ metrics: [InsightMetric], direction: InsightDirection?) -> some View {
@@ -1617,10 +1890,44 @@ struct AtlasView: View {
             VStack(alignment: .leading, spacing: 9) {
                 Text("EVIDENCE").font(.caption2.bold()).tracking(1).foregroundStyle(.secondary)
                 ForEach(theme.evidence, id: \.self) { item in
-                    HStack(alignment: .top, spacing: 9) {
-                        Image(systemName: "plus").font(.caption2.bold()).foregroundStyle(color).padding(.top, 3)
-                        Text(item).font(.callout).foregroundStyle(.secondary)
+                    let evidenceID = "\(theme.id):\(item)"
+                    Button {
+                        withAnimation(.smooth(duration: 0.3)) {
+                            model.exploreInsight(theme: theme, evidence: item)
+                        }
+                        DispatchQueue.main.async { composerFocused = true }
+                    } label: {
+                        HStack(alignment: .top, spacing: 9) {
+                            Image(systemName: "plus")
+                                .font(.caption2.bold())
+                                .foregroundStyle(color)
+                                .padding(.top, 3)
+                            Text(item)
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                                .multilineTextAlignment(.leading)
+                            Spacer(minLength: 6)
+                            Image(systemName: "bubble.left.and.text.bubble.right")
+                                .font(.caption)
+                                .foregroundStyle(
+                                    hoveredEvidencePoint == evidenceID ? color : Color.secondary.opacity(0.55)
+                                )
+                                .padding(.top, 2)
+                        }
+                        .padding(8)
+                        .background(
+                            color.opacity(hoveredEvidencePoint == evidenceID ? 0.10 : 0),
+                            in: RoundedRectangle(cornerRadius: 9)
+                        )
                     }
+                    .buttonStyle(.plain)
+                    .disabled(model.isSending)
+                    .onHover { hovering in
+                        withAnimation(.easeOut(duration: 0.14)) {
+                            hoveredEvidencePoint = hovering ? evidenceID : nil
+                        }
+                    }
+                    .help("Chat about this evidence")
                 }
             }
 
@@ -2087,9 +2394,13 @@ struct AtlasView: View {
                 Text("understand?").foregroundStyle(accent)
             }
             .font(.system(size: 50, weight: .regular, design: .serif)).tracking(-1.4)
-            Text("Ask about a person, a promise, a recurring dynamic, or how you have changed. Atlas keeps your conversation history here.")
+            Text(model.insightEvidenceContext == nil
+                 ? "Ask about a person, a promise, a recurring dynamic, or how you have changed. Atlas keeps your conversation history here."
+                 : "Ask a question, challenge the interpretation, or have Atlas trace this evidence across time and relationships.")
                 .font(.title3).foregroundStyle(.secondary).frame(maxWidth: 680, alignment: .leading)
-            suggestionChips
+            if model.insightEvidenceContext == nil {
+                suggestionChips
+            }
             composer
             Spacer()
         }
@@ -2178,9 +2489,20 @@ struct AtlasView: View {
 
     private var composer: some View {
         VStack(alignment: .leading, spacing: 12) {
-            TextField("Ask Atlas…", text: $model.prompt, axis: .vertical)
+            if let context = model.insightEvidenceContext {
+                insightEvidenceAttachment(context)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+            TextField(
+                model.insightEvidenceContext == nil
+                    ? "Ask Atlas…"
+                    : "What do you want to understand about this?",
+                text: $model.prompt,
+                axis: .vertical
+            )
                 .textFieldStyle(.plain)
                 .font(.system(size: 18))
+                .focused($composerFocused)
                 .lineLimit(compactComposer ? 1...4 : 2...6)
                 .frame(height: effectiveComposerTextHeight, alignment: .topLeading)
                 .padding(.vertical, compactComposer ? 2 : 6)
@@ -2215,9 +2537,8 @@ struct AtlasView: View {
                     if keyPress.modifiers.contains(.shift) {
                         return .ignored
                     }
-                    guard !model.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                          !model.isSending else { return .handled }
-                    Task { await model.send(responseProfile: responseProfile) }
+                    guard composerCanSubmit, !model.isSending else { return .handled }
+                    submitComposer()
                     return .handled
                 }
             HStack {
@@ -2226,14 +2547,18 @@ struct AtlasView: View {
                     if selectedChatIsSending {
                         Task { await model.stopSending() }
                     } else {
-                        Task { await model.send(responseProfile: responseProfile) }
+                        submitComposer()
                     }
                 } label: {
                     Label(
-                        selectedChatIsSending ? "Stop" : "Send",
-                        systemImage: selectedChatIsSending ? "stop.fill" : "arrow.up"
+                        selectedChatIsSending
+                            ? "Stop"
+                            : (isDirectEvidenceExploration ? "Dig deeper" : "Send"),
+                        systemImage: selectedChatIsSending
+                            ? "stop.fill"
+                            : (isDirectEvidenceExploration ? "sparkles" : "arrow.up")
                     )
-                    .frame(minWidth: 62)
+                    .frame(minWidth: isDirectEvidenceExploration ? 92 : 62)
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
@@ -2241,7 +2566,7 @@ struct AtlasView: View {
                 .disabled(selectedChatIsSending
                           ? model.sendingChatID == nil
                           : model.isSending
-                            || model.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                            || !composerCanSubmit)
             }
         }
         .padding(compactComposer ? 12 : 18)
@@ -2259,6 +2584,71 @@ struct AtlasView: View {
         )
         .shadow(color: .black.opacity(colorScheme == .dark ? 0.24 : 0.07), radius: 24, y: 8)
         .animation(.smooth(duration: 0.22), value: compactComposer)
+        .animation(.smooth(duration: 0.25), value: model.insightEvidenceContext)
+    }
+
+    private var isDirectEvidenceExploration: Bool {
+        model.insightEvidenceContext != nil
+            && model.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var composerCanSubmit: Bool {
+        !model.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || model.insightEvidenceContext != nil
+    }
+
+    private func submitComposer() {
+        if isDirectEvidenceExploration {
+            model.prompt = "Dig deeper into this evidence."
+        }
+        Task { await model.send(responseProfile: responseProfile) }
+    }
+
+    private func insightEvidenceAttachment(_ context: InsightEvidenceContext) -> some View {
+        HStack(alignment: .top, spacing: 11) {
+            Image(systemName: "scope")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(accent)
+                .frame(width: 30, height: 30)
+                .background(accent.opacity(0.13), in: RoundedRectangle(cornerRadius: 9))
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("EXPLORING EVIDENCE")
+                    .font(.system(size: 9, weight: .bold))
+                    .tracking(1)
+                    .foregroundStyle(accent)
+                Text(context.theme)
+                    .font(.caption.weight(.semibold))
+                    .lineLimit(1)
+                Text(context.evidence)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer(minLength: 8)
+            Button {
+                withAnimation(.smooth(duration: 0.2)) {
+                    model.dismissInsightContext()
+                }
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.caption.bold())
+                    .foregroundStyle(.secondary)
+                    .frame(width: 24, height: 24)
+                    .background(Color.secondary.opacity(0.08), in: Circle())
+            }
+            .buttonStyle(.plain)
+            .disabled(model.isSending)
+            .help("Remove evidence context")
+        }
+        .padding(11)
+        .background(accent.opacity(0.075), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 13, style: .continuous)
+                .stroke(accent.opacity(0.16), lineWidth: 1)
+        )
     }
 
     private var composerMinimumTextHeight: CGFloat {

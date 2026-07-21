@@ -29,7 +29,7 @@ mkdir -p "$project_dir/bin" "$atlas_home_dir/Library/LaunchAgents" "$atlas_home_
 "$node_bin" "$npm_cli" install --prefix "$project_dir"
 /usr/bin/swiftc -target arm64-apple-macos14.0 "$project_dir/src/AttributedBodyDecoder.swift" -o "$project_dir/bin/atlas-attributed-decoder"
 /usr/bin/swiftc -target arm64-apple-macos15.0 -parse-as-library "$project_dir/src/ToneCoreMLRunner.swift" -framework CoreML -o "$project_dir/bin/atlas-tone-coreml-runner"
-/usr/bin/swiftc -target arm64-apple-macos14.0 -parse-as-library "$project_dir/src/CalendarBridge.swift" "$project_dir/src/AtlasApp.swift" -framework SwiftUI -framework LocalAuthentication -framework AppKit -framework UserNotifications -framework EventKit -o "$project_dir/bin/Atlas"
+/usr/bin/swiftc -target arm64-apple-macos14.0 -parse-as-library "$project_dir/src/CalendarBridge.swift" "$project_dir/src/AtlasApp.swift" -framework SwiftUI -framework Charts -framework LocalAuthentication -framework AppKit -framework UserNotifications -framework EventKit -o "$project_dir/bin/Atlas"
 /usr/bin/plutil -lint "$project_dir/config/Info.plist"
 /usr/bin/sed \
   -e "s|__NODE_BIN__|$node_bin|g" \
