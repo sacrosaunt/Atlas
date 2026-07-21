@@ -41,7 +41,9 @@ Names, dates, relationship-relevant prose, contact nicknames, company names,
 job titles, and departments may still be sent when relevant. Automated
 redaction is defense in depth, not a guarantee that every identifying detail or
 unusual secret will be detected. Onboarding presents this limitation before
-Messages access is used.
+any Messages data can be exposed to Codex or sent to OpenAI. The service stores
+the current disclosure approval locally and returns an error from every Codex
+and MCP data route until that approval exists.
 
 Atlas never uploads the `chat.db` database file or attachment contents.
 
@@ -69,6 +71,12 @@ started with approval policy `never`, a read-only sandbox, network access off
 for tools, and shell, browser, app, image, and multi-agent capabilities
 disabled. Only the Atlas MCP is enabled.
 
+The Login Agent remains available so Atlas can reconnect quickly, but it is
+CPU-idle without an Atlas window. The app renews a short foreground lease while
+its window exists. Closing Atlas expires that lease, aborts in-flight analysis,
+and pauses full-text indexing, embeddings, tone processing, automatic insights,
+suggestions, and chats until Atlas is opened again.
+
 Atlas uses a dedicated Codex home at
 `~/Library/Application Support/Atlas/CodexHome`, so its resumable threads do not
 appear in the Codex desktop app. Deleting an Atlas conversation also deletes
@@ -78,9 +86,9 @@ its corresponding Codex thread.
 
 ### Full-text search
 
-Atlas builds a private SQLite FTS sidecar as soon as Messages access is
-available. It processes the archive locally and never modifies Apple's
-`chat.db`. Literal message searches use this sidecar and fall back to a
+Atlas builds a private SQLite FTS sidecar while the app is open and Messages
+access is available. It processes the archive locally and never modifies
+Apple's `chat.db`. Literal message searches use this sidecar and fall back to a
 read-only database scan only while initial indexing is incomplete.
 
 ### Tone analysis
@@ -94,7 +102,8 @@ retrieved separately when the model needs qualitative evidence.
 The production classifier uses a fixed-shape FP16 Core ML package with
 length-bucketed batches. Tone processing runs on battery unless Low Power Mode
 is enabled, and it pauses under serious thermal pressure. Its ETA appears after
-a 30-second warm-up and refreshes once per minute.
+a 30-second warm-up and refreshes once per minute. Closing Atlas pauses tone
+processing.
 
 ### Enhanced semantic search
 
@@ -106,6 +115,7 @@ semantic match is not misrepresented as archive-wide evidence.
 Semantic optimization pauses on battery, in Low Power Mode, or under serious
 thermal pressure. On external power, Atlas prevents idle system sleep while
 long-running optimization is active; the display may still sleep.
+Closing Atlas releases the sleep assertion and pauses optimization.
 
 ## MCP tools
 

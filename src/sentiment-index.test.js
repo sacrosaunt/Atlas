@@ -54,6 +54,29 @@ test("tone inference groups similarly sized text while preserving every unit", (
   assert.deepEqual(rows.map((row) => row.id), [1, 2, 3, 4]);
 });
 
+test("tone analysis waits for an Atlas window", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "atlas-tone-foreground-test-"));
+  const sentiment = new SentimentIndex({
+    databaseProvider: () => { throw new Error("database should not be opened"); },
+    textIndexReadyProvider: () => false,
+    stateDirectory: directory,
+    sleepAssertionEnabled: false,
+  });
+  sentiment.isModelInstalled = () => true;
+  try {
+    sentiment.start();
+    assert.equal(sentiment.status().phase, "waiting_for_app");
+    assert.equal(sentiment.status().pause_reason, "app_not_active");
+    sentiment.setForegroundActive(true);
+    assert.equal(sentiment.status().phase, "waiting_for_index");
+    sentiment.setForegroundActive(false);
+    assert.equal(sentiment.status().phase, "waiting_for_app");
+  } finally {
+    await sentiment.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("tone analysis stores both measurements and returns scoped aggregates", async () => {
   const directory = mkdtempSync(join(tmpdir(), "atlas-tone-test-"));
   const searchDirectory = join(directory, "search");
@@ -98,6 +121,8 @@ test("tone analysis stores both measurements and returns scoped aggregates", asy
   });
   sentiment.modelVerified = true;
   sentiment.isModelInstalled = () => true;
+  semantic.foregroundActive = true;
+  sentiment.foregroundActive = true;
   try {
     await semantic.indexMessages(new AbortController().signal);
     await sentiment.analyze(new AbortController().signal);

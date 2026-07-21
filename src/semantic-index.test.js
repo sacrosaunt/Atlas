@@ -71,6 +71,29 @@ test("completed download bytes remain visible during verification", async () => 
   }
 });
 
+test("indexing stays paused until an Atlas window is active", async () => {
+  let reads = 0;
+  const fixture = temporaryIndex({
+    indexableConversations: () => {
+      reads += 1;
+      return [];
+    },
+  });
+  try {
+    fixture.index.start();
+    assert.equal(fixture.index.status().text_index_phase, "paused");
+    assert.equal(fixture.index.status().pause_reason, "app_not_active");
+    assert.equal(reads, 0);
+
+    fixture.index.setForegroundActive(true);
+    await fixture.index.job;
+    assert.equal(reads, 1);
+    assert.equal(fixture.index.status().text_index_phase, "ready");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 test("background indexing creates private chunks that hybrid search can filter", async () => {
   const messages = Array.from({ length: 10 }, (_, index) => ({
     message_id: index + 1,
@@ -102,6 +125,7 @@ test("background indexing creates private chunks that hybrid search can filter",
   try {
     fixture.installSparsePlaceholder();
     fixture.index.enabled = true;
+    fixture.index.foregroundActive = true;
     const vector = testVector();
     const embeddedTexts = [];
     const processingOrder = [];
@@ -155,6 +179,7 @@ test("optimization pauses on battery and resumes when power returns", async () =
     powerPausePollMs: 5,
   });
   try {
+    fixture.index.foregroundActive = true;
     const waiting = fixture.index.waitForPower(new AbortController().signal);
     assert.equal(fixture.index.phase, "paused");
     assert.equal(fixture.index.status().pause_reason, "battery");

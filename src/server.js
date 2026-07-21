@@ -24,6 +24,27 @@ const stateDirectory = join(homedir(), "Library", "Application Support", "Atlas"
 const tokenPath = join(stateDirectory, "mcp-token");
 const identityKeyPath = join(stateDirectory, "identity-key");
 const starterSuggestionsCachePath = join(stateDirectory, "starter-suggestions.json");
+const consentPath = join(stateDirectory, "consent.json");
+const DISCLOSURE_VERSION = 1;
+const APP_LEASE_MS = 15_000;
+
+function loadConsent() {
+  try {
+    const consent = JSON.parse(readFileSync(consentPath, "utf8"));
+    return consent.accepted === true && consent.disclosure_version === DISCLOSURE_VERSION;
+  } catch {
+    return false;
+  }
+}
+
+function saveConsent() {
+  writeFileSync(consentPath, `${JSON.stringify({
+    accepted: true,
+    disclosure_version: DISCLOSURE_VERSION,
+    accepted_at: new Date().toISOString(),
+  }, null, 2)}\n`, { mode: 0o600 });
+}
+
 function loadToken() {
   mkdirSync(stateDirectory, { recursive: true, mode: 0o700 });
   if (existsSync(tokenPath)) return readFileSync(tokenPath, "utf8").trim();
@@ -90,10 +111,37 @@ const sentimentIndex = new SentimentIndex({
 });
 semanticIndex.setPreEmbeddingTask(() => sentimentIndex.onTextIndexReady());
 const app = createMcpExpressApp({ host: HOST });
-const closeMcp = mountMcp(app, { store, token, semanticIndex, sentimentIndex });
+const closeMcp = mountMcp(app, {
+  store,
+  token,
+  semanticIndex,
+  sentimentIndex,
+  consentProvider: loadConsent,
+  activityProvider: () => analysisActive && Date.now() < appLeaseExpiresAt,
+});
 sentimentIndex.start();
 semanticIndex.start();
+let appLeaseExpiresAt = 0;
+let analysisActive = false;
+
+function setAnalysisActive(active) {
+  const changed = analysisActive !== active;
+  analysisActive = active;
+  semanticIndex.setForegroundActive(active);
+  sentimentIndex.setForegroundActive(active);
+  if (!active && changed) {
+    for (const running of activeChats.values()) running.controller.abort();
+    for (const controller of backgroundCodexControllers) controller.abort();
+  }
+}
+
+const appLeaseTimer = setInterval(() => {
+  if (analysisActive && Date.now() >= appLeaseExpiresAt) setAnalysisActive(false);
+}, 1_000);
+appLeaseTimer.unref?.();
+
 const activeChats = new Map();
+const backgroundCodexControllers = new Set();
 const chatActivities = new Map();
 let insightRefresh = null;
 let cachedDirection = null;
@@ -267,6 +315,18 @@ function requireApp(req, res) {
   return false;
 }
 
+function requireConsent(_req, res) {
+  if (loadConsent()) return true;
+  res.status(428).json({ error: "Approve the data disclosure in Atlas before using OpenAI analysis" });
+  return false;
+}
+
+function requireActiveApp(_req, res) {
+  if (analysisActive && Date.now() < appLeaseExpiresAt) return true;
+  res.status(409).json({ error: "Open Atlas before starting analysis" });
+  return false;
+}
+
 function readPrompt(req, res) {
   const prompt = typeof req.body?.prompt === "string" ? req.body.prompt.trim() : "";
   if (!prompt || prompt.length > 8_000) {
@@ -355,6 +415,8 @@ async function generateChatMetadata(chatId, userMessage, assistantResponse, sign
 function refreshStarterSuggestions() {
   if (starterSuggestionsRefresh) return starterSuggestionsRefresh;
   if (starterSuggestionsAreFresh()) return Promise.resolve();
+  const controller = new AbortController();
+  backgroundCodexControllers.add(controller);
   starterSuggestionsRefresh = (async () => {
     const recentConversations = store.listConversations({ limit: 24 })
       .filter((conversation) => conversation.name !== "Unnamed conversation"
@@ -393,6 +455,7 @@ function refreshStarterSuggestions() {
       ...RESPONSE_PROFILES.faster,
       developerInstructions: SUGGESTION_INSTRUCTIONS,
       mcpEnabled: false,
+      signal: controller.signal,
     });
     const generated = JSON.parse(result.response).suggestions
       .map((suggestion) => suggestion.replace(/\s+/g, " ").trim())
@@ -403,12 +466,16 @@ function refreshStarterSuggestions() {
     saveStarterSuggestionsCache();
   })()
     .catch((error) => {
+      if (controller.signal.aborted) return;
       console.error("Starter suggestion generation failed", error);
       starterSuggestions ??= STARTER_SUGGESTIONS;
       starterSuggestionsGeneratedAt = Date.now();
       saveStarterSuggestionsCache();
     })
-    .finally(() => { starterSuggestionsRefresh = null; });
+    .finally(() => {
+      backgroundCodexControllers.delete(controller);
+      starterSuggestionsRefresh = null;
+    });
   return starterSuggestionsRefresh;
 }
 
@@ -553,6 +620,8 @@ function launchContinuation(chat, prompt, responseProfile = "deeper") {
 
 async function refreshInsights() {
   if (insightRefresh) return insightRefresh;
+  const controller = new AbortController();
+  backgroundCodexControllers.add(controller);
   insightRefresh = (async () => {
     history.beginInsightRefresh();
     const current = history.getInsights();
@@ -591,12 +660,22 @@ Follow the supplied JSON schema.
             ...codexOptions(prompt),
             threadId: current.codex_thread_id,
             outputSchema: INSIGHT_SCHEMA,
+            signal: controller.signal,
           });
-        } catch {
-          result = await createCodexConversation({ ...codexOptions(prompt), outputSchema: INSIGHT_SCHEMA });
+        } catch (error) {
+          if (controller.signal.aborted) throw error;
+          result = await createCodexConversation({
+            ...codexOptions(prompt),
+            outputSchema: INSIGHT_SCHEMA,
+            signal: controller.signal,
+          });
         }
       } else {
-        result = await createCodexConversation({ ...codexOptions(prompt), outputSchema: INSIGHT_SCHEMA });
+        result = await createCodexConversation({
+          ...codexOptions(prompt),
+          outputSchema: INSIGHT_SCHEMA,
+          signal: controller.signal,
+        });
       }
       const document = JSON.parse(result.response);
       history.completeInsightRefresh({
@@ -607,8 +686,9 @@ Follow the supplied JSON schema.
       });
     } catch (error) {
       history.failInsightRefresh(error);
-      console.error("Insight refresh failed", error);
+      if (!controller.signal.aborted) console.error("Insight refresh failed", error);
     } finally {
+      backgroundCodexControllers.delete(controller);
       insightRefresh = null;
     }
   })();
@@ -639,7 +719,8 @@ app.get("/api/setup", (_req, res) => {
   const codexPath = resolveCodexPath();
   const codexInstalled = Boolean(codexPath);
   let codexLoggedIn = false;
-  if (codexInstalled) {
+  const disclosureAccepted = loadConsent();
+  if (codexInstalled && disclosureAccepted) {
     const login = spawnSync(codexPath, ["login", "status"], {
       encoding: "utf8",
       timeout: 5_000,
@@ -653,11 +734,41 @@ app.get("/api/setup", (_req, res) => {
     full_disk_access_error: fullDiskAccessError,
     codex_installed: codexInstalled,
     codex_logged_in: codexLoggedIn,
+    disclosure_accepted: disclosureAccepted,
     codex_path: codexPath,
     service_executable: process.execPath,
     install_command: "npm install --global @openai/codex",
     login_command: "codex login",
   });
+});
+
+app.get("/api/consent", (req, res) => {
+  if (!requireApp(req, res)) return;
+  res.json({ accepted: loadConsent(), disclosure_version: DISCLOSURE_VERSION });
+});
+
+app.post("/api/consent", (req, res) => {
+  if (!requireApp(req, res)) return;
+  if (req.body?.accepted !== true || req.body?.disclosure_version !== DISCLOSURE_VERSION) {
+    res.status(400).json({ error: "Explicit acceptance of the current disclosure is required" });
+    return;
+  }
+  saveConsent();
+  res.json({ accepted: true, disclosure_version: DISCLOSURE_VERSION });
+});
+
+app.post("/api/app/heartbeat", (req, res) => {
+  if (!requireApp(req, res)) return;
+  appLeaseExpiresAt = Date.now() + APP_LEASE_MS;
+  setAnalysisActive(true);
+  res.json({ active: true, lease_ms: APP_LEASE_MS });
+});
+
+app.delete("/api/app/heartbeat", (req, res) => {
+  if (!requireApp(req, res)) return;
+  appLeaseExpiresAt = 0;
+  setAnalysisActive(false);
+  res.json({ active: false });
 });
 
 app.post("/api/restart", (req, res) => {
@@ -715,6 +826,8 @@ app.get("/api/chats", (req, res) => {
 
 app.get("/api/suggestions", (req, res) => {
   if (!requireApp(req, res)) return;
+  if (!requireConsent(req, res)) return;
+  if (!requireActiveApp(req, res)) return;
   if (!starterSuggestionsRefresh && !starterSuggestionsAreFresh()) {
     void refreshStarterSuggestions();
   }
@@ -726,6 +839,8 @@ app.get("/api/suggestions", (req, res) => {
 
 app.post("/api/suggestions/refresh", (req, res) => {
   if (!requireApp(req, res)) return;
+  if (!requireConsent(req, res)) return;
+  if (!requireActiveApp(req, res)) return;
   if (!starterSuggestionsRefresh && !starterSuggestionsAreFresh()) {
     void refreshStarterSuggestions();
   }
@@ -737,6 +852,8 @@ app.post("/api/suggestions/refresh", (req, res) => {
 
 app.post("/api/chats", async (req, res) => {
   if (!requireApp(req, res)) return;
+  if (!requireConsent(req, res)) return;
+  if (!requireActiveApp(req, res)) return;
   const prompt = readPrompt(req, res);
   if (!prompt) return;
   if (activeChats.size >= 2) {
@@ -816,6 +933,8 @@ app.post("/api/chats/:id/stop", async (req, res) => {
 
 app.post("/api/chats/:id/messages", async (req, res) => {
   if (!requireApp(req, res)) return;
+  if (!requireConsent(req, res)) return;
+  if (!requireActiveApp(req, res)) return;
   const prompt = readPrompt(req, res);
   if (!prompt) return;
   const chat = history.getChat(req.params.id);
@@ -836,6 +955,8 @@ app.post("/api/chats/:id/messages", async (req, res) => {
 
 app.get("/api/insights", (req, res) => {
   if (!requireApp(req, res)) return;
+  if (!requireConsent(req, res)) return;
+  if (!requireActiveApp(req, res)) return;
   const snapshot = history.getInsights();
   const messageCount = store.info().messages;
   const age = snapshot.updated_at ? Date.now() - Date.parse(snapshot.updated_at) : Infinity;
@@ -882,6 +1003,8 @@ app.get("/api/insights", (req, res) => {
 
 app.post("/api/insights/refresh", (req, res) => {
   if (!requireApp(req, res)) return;
+  if (!requireConsent(req, res)) return;
+  if (!requireActiveApp(req, res)) return;
   void refreshInsights();
   res.status(202).json({ status: "refreshing" });
 });
@@ -889,6 +1012,8 @@ app.post("/api/insights/refresh", (req, res) => {
 // Compatibility for the original launcher API. Atlas never opens the Codex app.
 app.post("/api/conversations", async (req, res) => {
   if (!requireApp(req, res)) return;
+  if (!requireConsent(req, res)) return;
+  if (!requireActiveApp(req, res)) return;
   const prompt = readPrompt(req, res);
   if (!prompt) return;
   try {
@@ -912,6 +1037,7 @@ const httpServer = app.listen(PORT, HOST, () => {
 });
 
 async function shutdown(exitCode = 0) {
+  clearInterval(appLeaseTimer);
   httpServer.close();
   await closeMcp();
   await sentimentIndex.close();

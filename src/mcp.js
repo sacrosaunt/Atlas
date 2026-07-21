@@ -34,7 +34,7 @@ function errorResult(error) {
 
 export function createAtlasMcp(store, semanticIndex, sentimentIndex) {
   const server = new McpServer(
-    { name: "Atlas iMessage", version: "0.4.1" },
+    { name: "Atlas iMessage", version: "0.4.2" },
     {
       instructions: [
         "Atlas provides read-only access to your local iMessage database.",
@@ -217,12 +217,27 @@ function authorized(req, expectedToken) {
   return supplied.length === expected.length && timingSafeEqual(supplied, expected);
 }
 
-export function mountMcp(app, { store, token, semanticIndex, sentimentIndex }) {
+export function mountMcp(app, {
+  store,
+  token,
+  semanticIndex,
+  sentimentIndex,
+  consentProvider = () => true,
+  activityProvider = () => true,
+}) {
   const transports = new Map();
 
   app.use("/mcp", (req, res, next) => {
     if (!authorized(req, token)) {
       res.status(401).set("WWW-Authenticate", "Bearer").send("Unauthorized");
+      return;
+    }
+    if (!consentProvider()) {
+      res.status(428).send("Approve the Atlas data disclosure before accessing Messages");
+      return;
+    }
+    if (!activityProvider()) {
+      res.status(409).send("Open Atlas before accessing Messages");
       return;
     }
     next();

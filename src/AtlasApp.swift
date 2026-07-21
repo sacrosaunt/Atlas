@@ -4,7 +4,7 @@ import AppKit
 
 private let serviceURL = URL(string: "http://127.0.0.1:47831")!
 private let tokenPath = NSString(string: "~/Library/Application Support/Atlas/mcp-token").expandingTildeInPath
-private let currentOnboardingVersion = 2
+private let currentOnboardingVersion = 3
 
 private struct HealthResponse: Decodable {
     let ok: Bool
@@ -31,6 +31,11 @@ private struct SetupResponse: Decodable {
     let login_command: String
 }
 private struct RestartResponse: Decodable { let restarting: Bool }
+private struct ConsentResponse: Decodable {
+    let accepted: Bool
+    let disclosure_version: Int
+}
+private struct AppHeartbeatResponse: Decodable { let active: Bool }
 
 struct SemanticSearchStatus: Decodable, Equatable {
     let enabled: Bool
@@ -85,6 +90,7 @@ private func atlasPauseText(_ reason: String?) -> String {
     case "battery": return "Connect power to continue"
     case "low_power_mode": return "Turn off Low Power Mode to continue"
     case "thermal": return "Waiting for your Mac to cool down"
+    case "app_not_active": return "Open Atlas to continue"
     default: return "Optimization will resume automatically"
     }
 }
@@ -381,6 +387,33 @@ final class AtlasModel: ObservableObject {
         }
     }
 
+    func acceptDisclosure() async -> Bool {
+        error = nil
+        do {
+            let response: ConsentResponse = try await request(
+                path: "api/consent",
+                method: "POST",
+                body: ["accepted": true, "disclosure_version": 1]
+            )
+            return response.accepted && response.disclosure_version == 1
+        } catch {
+            self.error = "Atlas couldn't record your data disclosure approval. Try again."
+            return false
+        }
+    }
+
+    func renewAppLease() async {
+        let _: AppHeartbeatResponse? = try? await request(
+            path: "api/app/heartbeat",
+            method: "POST",
+            body: [:]
+        )
+    }
+
+    func releaseAppLease() async {
+        let _: AppHeartbeatResponse? = try? await request(path: "api/app/heartbeat", method: "DELETE")
+    }
+
     func loadChats() async {
         do {
             let response: ChatListResponse = try await request(path: "api/chats")
@@ -662,7 +695,7 @@ final class AtlasModel: ObservableObject {
     private func request<T: Decodable>(
         path: String,
         method: String = "GET",
-        body: [String: String]? = nil
+        body: [String: Any]? = nil
     ) async throws -> T {
         let token = try String(contentsOfFile: tokenPath, encoding: .utf8)
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -769,6 +802,15 @@ struct AtlasView: View {
                 try? await Task.sleep(for: delay)
             }
         }
+        .task {
+            while !Task.isCancelled {
+                await model.renewAppLease()
+                try? await Task.sleep(for: .seconds(5))
+            }
+        }
+        .onDisappear {
+            Task { await model.releaseAppLease() }
+        }
         .onChange(of: scenePhase) { _, phase in
             if onboardingVersion >= currentOnboardingVersion && touchIDEnabled && phase != .active { model.lock() }
         }
@@ -863,7 +905,7 @@ struct AtlasView: View {
                     }
                 }
                 if let sentiment = model.sentiment,
-                   ["downloading", "preparing", "analyzing", "paused"].contains(sentiment.phase) {
+                   ["downloading", "preparing", "analyzing", "paused", "waiting_for_app"].contains(sentiment.phase) {
                     sidebarSentimentProgress(sentiment)
                         .padding(.horizontal, 14)
                         .padding(.bottom, 8)
@@ -989,6 +1031,7 @@ struct AtlasView: View {
 
     private func sidebarSentimentProgress(_ status: SentimentStatus) -> some View {
         let isDownloading = status.phase == "downloading"
+        let isPaused = ["paused", "waiting_for_app"].contains(status.phase)
         let completedUnits = status.analyzed_turns + status.analyzed_windows
         let totalUnits = status.total_turns + status.total_windows
         let completed = isDownloading ? status.downloaded_bytes : Int64(completedUnits)
@@ -1000,14 +1043,14 @@ struct AtlasView: View {
                     .foregroundStyle(accent)
                 Text(isDownloading
                      ? "Downloading tone analysis…"
-                     : (status.phase == "paused" ? "Tone analysis paused" : "Analyzing conversational tone…"))
+                     : (isPaused ? "Tone analysis paused" : "Analyzing conversational tone…"))
                     .font(.caption.weight(.semibold)).lineLimit(1)
                 Spacer(minLength: 4)
                 Text(fraction.formatted(.percent.precision(.fractionLength(0))))
                     .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
             }
             ProgressView(value: fraction).tint(accent)
-            if status.phase == "paused" {
+            if ["paused", "waiting_for_app"].contains(status.phase) {
                 Text(atlasPauseText(status.pause_reason))
                     .font(.caption2).foregroundStyle(.secondary)
             } else if isDownloading {
@@ -2010,7 +2053,7 @@ private struct AtlasSettingsView: View {
                             ? min(1, Double(status.embedded_documents) / Double(status.total_documents))
                             : 0
                     ).tint(accent)
-                    Text("Fast text search is ready. Related-meaning results will improve as this finishes in the background.")
+                    Text("Fast text search is ready. Related-meaning results improve while Atlas remains open.")
                         .font(.caption).foregroundStyle(.secondary)
                     if status.preventing_sleep {
                         Label("This Mac will stay awake on power; the display can still turn off.", systemImage: "moon.zzz")
@@ -2155,6 +2198,7 @@ private struct AtlasOnboardingView: View {
     @Environment(\.colorScheme) private var colorScheme
     @State private var page = 0
     @State private var acceptedDisclosure = false
+    @State private var recordingDisclosure = false
     @State private var navigationDirection = 1
 
     private var accent: Color {
@@ -2211,9 +2255,20 @@ private struct AtlasOnboardingView: View {
                 }
                 Button(page == 4 ? (touchIDEnabled ? "Unlock Atlas" : "Open Atlas") : "Continue") {
                     if page < 4 {
-                        navigationDirection = 1
-                        withAnimation(.smooth(duration: 0.36)) { page += 1 }
-                        if page == 4 { Task { await model.checkSetup() } }
+                        if page == 2 {
+                            recordingDisclosure = true
+                            Task {
+                                if await model.acceptDisclosure() {
+                                    navigationDirection = 1
+                                    withAnimation(.smooth(duration: 0.36)) { page += 1 }
+                                }
+                                recordingDisclosure = false
+                            }
+                        } else {
+                            navigationDirection = 1
+                            withAnimation(.smooth(duration: 0.36)) { page += 1 }
+                            if page == 4 { Task { await model.checkSetup() } }
+                        }
                     } else {
                         onComplete()
                     }
@@ -2236,7 +2291,7 @@ private struct AtlasOnboardingView: View {
                 async let semanticRefresh: Void = model.loadSemanticStatus()
                 async let toneRefresh: Void = model.loadSentimentStatus()
                 _ = await (semanticRefresh, toneRefresh)
-                let working = ["downloading", "preparing", "analyzing", "paused"]
+                let working = ["downloading", "preparing", "analyzing", "paused", "waiting_for_app"]
                     .contains(model.sentiment?.phase ?? "")
                     || ["downloading", "verifying", "indexing", "embedding", "paused"]
                     .contains(model.semanticSearch?.phase ?? "")
@@ -2253,7 +2308,7 @@ private struct AtlasOnboardingView: View {
     }
 
     private var canContinue: Bool {
-        if page == 2 { return acceptedDisclosure }
+        if page == 2 { return acceptedDisclosure && !recordingDisclosure }
         if page == 3 { return model.sentiment?.installed == true }
         if page == 4 {
             return model.fullDiskAccessReady && model.codexInstalled && model.codexLoggedIn
@@ -2369,6 +2424,13 @@ private struct AtlasOnboardingView: View {
             .padding(13)
             .background(acceptedDisclosure ? accent.opacity(0.10) : Color.secondary.opacity(0.07),
                         in: RoundedRectangle(cornerRadius: 13))
+
+            if recordingDisclosure {
+                Label("Recording your approval…", systemImage: "lock.shield")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else if let error = model.error {
+                Text(error).font(.caption).foregroundStyle(.red)
+            }
         }
     }
 
@@ -2805,8 +2867,24 @@ private extension String {
     }
 }
 
+private final class AtlasAppDelegate: NSObject, NSApplicationDelegate {
+    func applicationWillTerminate(_ notification: Notification) {
+        guard let token = try? String(contentsOfFile: tokenPath, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty else { return }
+        var request = URLRequest(url: serviceURL.appending(path: "api/app/heartbeat"))
+        request.httpMethod = "DELETE"
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.timeoutInterval = 1
+        let completed = DispatchSemaphore(value: 0)
+        URLSession.shared.dataTask(with: request) { _, _, _ in completed.signal() }.resume()
+        _ = completed.wait(timeout: .now() + .milliseconds(750))
+    }
+}
+
 @main
 struct AtlasApp: App {
+    @NSApplicationDelegateAdaptor(AtlasAppDelegate.self) private var appDelegate
+
     var body: some Scene {
         WindowGroup { AtlasView() }
             .windowStyle(.hiddenTitleBar)

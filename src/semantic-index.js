@@ -204,6 +204,7 @@ export class SemanticIndex {
     this.powerStateProvider = powerStateProvider;
     this.powerPausePollMs = powerPausePollMs;
     this.powerState = this.powerStateProvider();
+    this.foregroundActive = false;
     this.sleepAssertionEnabled = sleepAssertionEnabled;
     this.sleepAssertionProcess = null;
     this.preEmbeddingTask = preEmbeddingTask;
@@ -224,9 +225,10 @@ export class SemanticIndex {
   }
 
   start() {
-    this.startIndexing();
+    this.textPhase = "paused";
+    if (this.enabled && this.isModelInstalled()) this.phase = "paused";
     this.timer = setInterval(() => {
-      if (!this.job) this.startIndexing();
+      if (this.foregroundActive && !this.job) this.startIndexing();
     }, INDEX_INTERVAL_MS);
     this.timer.unref?.();
     this.powerTimer = setInterval(() => {
@@ -234,6 +236,23 @@ export class SemanticIndex {
       this.updateSleepAssertion();
     }, POWER_CHECK_INTERVAL_MS);
     this.powerTimer.unref?.();
+  }
+
+  setForegroundActive(active) {
+    const wasActive = this.foregroundActive;
+    this.foregroundActive = Boolean(active);
+    if (this.foregroundActive) {
+      const needsResume = !wasActive || this.textPhase === "paused" || this.phase === "paused";
+      if (needsResume && !this.job) this.startIndexing();
+      return;
+    }
+    this.updateSleepAssertion(false);
+    this.abortController?.abort();
+    if (this.textPhase === "indexing") this.textPhase = "paused";
+    if (this.enabled && this.isModelInstalled()
+      && ["preparing", "embedding", "paused"].includes(this.phase)) {
+      this.phase = "paused";
+    }
   }
 
   setPreEmbeddingTask(task) {
@@ -268,7 +287,9 @@ export class SemanticIndex {
       phase: this.phase,
       text_index_phase: this.textPhase,
       text_index_error: this.textError,
-      pause_reason: this.phase === "paused" ? this.powerState.reason : null,
+      pause_reason: !this.foregroundActive && (this.phase === "paused" || this.textPhase === "paused")
+        ? "app_not_active"
+        : (this.phase === "paused" ? this.powerState.reason : null),
       preventing_sleep: Boolean(this.sleepAssertionProcess),
       downloaded_bytes: ["downloading", "verifying"].includes(this.phase)
         ? this.downloadedBytes
@@ -291,7 +312,8 @@ export class SemanticIndex {
     this.enabled = true;
     this.error = null;
     this.writeSettings();
-    if (this.isModelInstalled()) this.startIndexing();
+    if (this.isModelInstalled() && this.foregroundActive) this.startIndexing();
+    else if (this.isModelInstalled()) this.phase = "paused";
     else this.startDownload();
     return this.status();
   }
@@ -341,8 +363,8 @@ export class SemanticIndex {
     this.downloadJob = this.downloadModel(this.downloadAbortController.signal)
       .then(async () => {
         if (this.job) await this.job.catch(() => {});
-        if (this.enabled) return this.startIndexing();
-        this.phase = "off";
+        if (this.enabled && this.foregroundActive) return this.startIndexing();
+        this.phase = this.enabled ? "paused" : "off";
         return undefined;
       })
       .catch((error) => this.handleJobError(error))
@@ -355,6 +377,11 @@ export class SemanticIndex {
 
   startIndexing() {
     if (this.job) return this.job;
+    if (!this.foregroundActive) {
+      if (this.textPhase !== "ready") this.textPhase = "paused";
+      if (this.enabled && this.isModelInstalled()) this.phase = "paused";
+      return undefined;
+    }
     this.abortController = new AbortController();
     this.job = this.indexMessages(this.abortController.signal)
       .catch((error) => {
@@ -372,7 +399,12 @@ export class SemanticIndex {
 
   handleJobError(error) {
     if (error?.name === "AbortError") {
-      this.phase = "off";
+      if (!this.foregroundActive) {
+        if (this.textPhase === "indexing") this.textPhase = "paused";
+        this.phase = this.enabled && this.isModelInstalled() ? "paused" : "off";
+      } else {
+        this.phase = "off";
+      }
       this.updateSleepAssertion(false);
       return;
     }
@@ -712,7 +744,13 @@ export class SemanticIndex {
     this.indexedDocuments = Number(database.prepare("SELECT COUNT(*) AS count FROM documents").get().count);
     this.totalDocuments = this.indexedDocuments;
     this.textPhase = "ready";
+    if (signal.aborted || !this.foregroundActive) {
+      throw new DOMException("Indexing paused while Atlas is closed", "AbortError");
+    }
     if (this.preEmbeddingTask) await this.preEmbeddingTask();
+    if (signal.aborted || !this.foregroundActive) {
+      throw new DOMException("Indexing paused while Atlas is closed", "AbortError");
+    }
     if (this.enabled && this.isModelInstalled()) await this.embedDocuments(signal);
     else if (this.phase !== "downloading") this.phase = "off";
   }
@@ -738,12 +776,16 @@ export class SemanticIndex {
     `);
     const updateEmbedding = database.prepare("UPDATE documents SET embedding = ? WHERE id = ?");
     while (true) {
-      if (signal.aborted || !this.enabled) throw new DOMException("Indexing cancelled", "AbortError");
+      if (signal.aborted || !this.enabled || !this.foregroundActive) {
+        throw new DOMException("Indexing cancelled", "AbortError");
+      }
       await this.waitForPower(signal);
       const rows = nextDocuments.all();
       if (!rows.length) break;
       for (let offset = 0; offset < rows.length; offset += EMBEDDING_WORKERS) {
-        if (signal.aborted || !this.enabled) throw new DOMException("Indexing cancelled", "AbortError");
+        if (signal.aborted || !this.enabled || !this.foregroundActive) {
+          throw new DOMException("Indexing cancelled", "AbortError");
+        }
         await this.waitForPower(signal);
         const batch = rows.slice(offset, offset + EMBEDDING_WORKERS);
         const batchStartedAt = performance.now();
@@ -783,6 +825,7 @@ export class SemanticIndex {
 
   updateSleepAssertion(shouldPrevent = (
     this.phase === "embedding"
+      && this.foregroundActive
       && this.powerState.verified
       && this.powerState.onAC
       && !this.powerState.shouldPause

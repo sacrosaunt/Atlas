@@ -247,6 +247,7 @@ export class SentimentIndex {
     this.etaPublishedAt = null;
     this.powerStateProvider = powerStateProvider;
     this.powerState = powerStateProvider();
+    this.foregroundActive = false;
     this.powerPollMs = powerPollMs;
     this.sleepAssertionEnabled = sleepAssertionEnabled;
     this.sleepAssertionProcess = null;
@@ -284,10 +285,31 @@ export class SentimentIndex {
     if (!this.enabled) return;
     if (!this.isModelInstalled()) {
       this.phase = "not_downloaded";
+    } else if (!this.foregroundActive) {
+      this.phase = "waiting_for_app";
     } else if (this.textIndexReadyProvider()) {
       this.startAnalysis();
     } else {
       this.phase = "waiting_for_index";
+    }
+  }
+
+  setForegroundActive(active) {
+    const wasActive = this.foregroundActive;
+    this.foregroundActive = Boolean(active);
+    if (this.foregroundActive) {
+      if (wasActive && this.phase !== "waiting_for_app") return;
+      if (!this.enabled || this.downloadJob || this.analysisJob) return;
+      if (!this.isModelInstalled()) this.phase = "not_downloaded";
+      else if (this.textIndexReadyProvider()) this.startAnalysis();
+      else this.phase = "waiting_for_index";
+      return;
+    }
+    this.updateSleepAssertion(false);
+    this.analysisAbortController?.abort();
+    if (this.enabled && this.isModelInstalled()
+      && !["ready", "downloading", "off", "error"].includes(this.phase)) {
+      this.phase = "waiting_for_app";
     }
   }
 
@@ -297,7 +319,9 @@ export class SentimentIndex {
       enabled: this.enabled,
       installed: this.isModelInstalled(),
       phase: this.phase,
-      pause_reason: this.phase === "paused" ? this.powerState.reason : null,
+      pause_reason: this.phase === "waiting_for_app"
+        ? "app_not_active"
+        : (this.phase === "paused" ? this.powerState.reason : null),
       preventing_sleep: Boolean(this.sleepAssertionProcess),
       downloaded_bytes: this.phase === "downloading" ? this.downloadedBytes : this.installedBytes(),
       total_download_bytes: TOTAL_DOWNLOAD_BYTES,
@@ -333,7 +357,8 @@ export class SentimentIndex {
     this.enabled = true;
     this.error = null;
     this.writeSettings();
-    if (this.isModelInstalled()) this.start();
+    if (this.isModelInstalled() && this.foregroundActive) this.start();
+    else if (this.isModelInstalled()) this.phase = "waiting_for_app";
     else this.startDownload();
     return this.status();
   }
@@ -353,6 +378,10 @@ export class SentimentIndex {
     if (!this.enabled) return;
     if (this.downloadJob) await this.downloadJob.catch(() => {});
     if (!this.isModelInstalled()) return;
+    if (!this.foregroundActive) {
+      this.phase = "waiting_for_app";
+      return;
+    }
     return this.startAnalysis();
   }
 
@@ -364,6 +393,7 @@ export class SentimentIndex {
     this.downloadJob = this.downloadModel(this.downloadAbortController.signal)
       .then(() => {
         if (!this.enabled) this.phase = "off";
+        else if (!this.foregroundActive) this.phase = "waiting_for_app";
         else if (this.textIndexReadyProvider()) return this.startAnalysis();
         else this.phase = "waiting_for_index";
         return undefined;
@@ -433,7 +463,9 @@ export class SentimentIndex {
   handleError(error) {
     this.updateSleepAssertion(false);
     if (error?.name === "AbortError") {
-      this.phase = this.enabled ? "waiting_for_index" : "off";
+      this.phase = this.enabled
+        ? (this.foregroundActive ? "waiting_for_index" : "waiting_for_app")
+        : "off";
       return;
     }
     this.phase = "error";
@@ -646,7 +678,8 @@ export class SentimentIndex {
 
   startAnalysis() {
     if (this.analysisJob) return this.analysisJob;
-    if (!this.enabled || !this.isModelInstalled() || !this.textIndexReadyProvider()) return undefined;
+    if (!this.enabled || !this.foregroundActive
+      || !this.isModelInstalled() || !this.textIndexReadyProvider()) return undefined;
     this.analysisAbortController = new AbortController();
     this.analysisJob = this.analyze(this.analysisAbortController.signal)
       .catch((error) => this.handleError(error))
@@ -714,13 +747,17 @@ export class SentimentIndex {
     this.etaPublishedAt = null;
     this.updateSleepAssertion();
     while (true) {
-      if (signal.aborted || !this.enabled) throw new DOMException("Tone analysis cancelled", "AbortError");
+      if (signal.aborted || !this.enabled || !this.foregroundActive) {
+        throw new DOMException("Tone analysis cancelled", "AbortError");
+      }
       await this.waitForPower(signal);
       const pendingRows = nextUnits.all();
       if (!pendingRows.length) break;
       const orderedRows = orderToneUnitsForInference(pendingRows);
       for (let offset = 0; offset < orderedRows.length; offset += INFERENCE_BATCH_SIZE) {
-        if (signal.aborted || !this.enabled) throw new DOMException("Tone analysis cancelled", "AbortError");
+        if (signal.aborted || !this.enabled || !this.foregroundActive) {
+          throw new DOMException("Tone analysis cancelled", "AbortError");
+        }
         await this.waitForPower(signal);
         const rows = orderedRows.slice(offset, offset + INFERENCE_BATCH_SIZE);
         const batchStartedAt = performance.now();
@@ -773,6 +810,7 @@ export class SentimentIndex {
 
   updateSleepAssertion(shouldPrevent = (
     this.phase === "analyzing"
+      && this.foregroundActive
       && this.powerState.verified
       && this.powerState.onAC
       && !this.powerState.shouldPause
