@@ -356,6 +356,12 @@ enum SidebarSelection: Hashable {
 }
 
 @MainActor
+final class AtlasAnalysisState: ObservableObject {
+    @Published var semanticSearch: SemanticSearchStatus?
+    @Published var sentiment: SentimentStatus?
+}
+
+@MainActor
 final class AtlasModel: ObservableObject {
     enum LockState: Equatable { case locked, unlocking, unlocked }
 
@@ -378,8 +384,6 @@ final class AtlasModel: ObservableObject {
     @Published var codexLoggedIn = false
     @Published var codexInstallCommand = "npm install --global @openai/codex"
     @Published var codexLoginCommand = "codex login"
-    @Published var semanticSearch: SemanticSearchStatus?
-    @Published var sentiment: SentimentStatus?
     @Published var toneTrends: ToneTrendsResponse?
     @Published var insightEvidenceContext: InsightEvidenceContext?
     @Published var suggestions: [String] = []
@@ -389,6 +393,7 @@ final class AtlasModel: ObservableObject {
     )
     @Published var firstInsightsReadyBanner = false
     @Published var error: String?
+    let analysis = AtlasAnalysisState()
     let calendar = AtlasCalendarBridge()
 
     private var authContext: LAContext?
@@ -445,6 +450,7 @@ final class AtlasModel: ObservableObject {
     }
 
     func loadInitialData() async {
+        await waitForLocalService()
         async let health: Void = checkHealth()
         async let history: Void = loadChats()
         async let profile: Void = loadInsights()
@@ -453,6 +459,22 @@ final class AtlasModel: ObservableObject {
         async let starters: Void = loadSuggestions()
         async let calendarRefresh: Void = calendar.refresh()
         _ = await (health, history, profile, semantic, tone, starters, calendarRefresh)
+    }
+
+    private func waitForLocalService() async {
+        for attempt in 0..<20 {
+            do {
+                var request = URLRequest(url: serviceURL.appending(path: "api/setup"))
+                request.timeoutInterval = 0.5
+                let (_, response) = try await URLSession.shared.data(for: request)
+                if let http = response as? HTTPURLResponse, http.statusCode == 200 { return }
+            } catch {
+                // The bundled service may still be starting. Retry briefly before
+                // the initial data requests surface a connection error.
+            }
+            guard attempt < 19 else { return }
+            try? await Task.sleep(for: .milliseconds(150))
+        }
     }
 
     func checkHealth() async {
@@ -712,7 +734,7 @@ final class AtlasModel: ObservableObject {
 
     func loadSemanticStatus() async {
         do {
-            semanticSearch = try await request(path: "api/semantic/status")
+            analysis.semanticSearch = try await request(path: "api/semantic/status")
         } catch {
             // Keep the rest of Atlas usable if enhanced search is unavailable.
         }
@@ -720,7 +742,7 @@ final class AtlasModel: ObservableObject {
 
     func enableSemanticSearch() async {
         do {
-            semanticSearch = try await request(path: "api/semantic/enable", method: "POST", body: [:])
+            analysis.semanticSearch = try await request(path: "api/semantic/enable", method: "POST", body: [:])
         } catch {
             self.error = error.localizedDescription
         }
@@ -728,7 +750,7 @@ final class AtlasModel: ObservableObject {
 
     func disableSemanticSearch() async {
         do {
-            semanticSearch = try await request(path: "api/semantic/disable", method: "POST", body: [:])
+            analysis.semanticSearch = try await request(path: "api/semantic/disable", method: "POST", body: [:])
         } catch {
             self.error = error.localizedDescription
         }
@@ -736,7 +758,7 @@ final class AtlasModel: ObservableObject {
 
     func removeSemanticSearch() async {
         do {
-            semanticSearch = try await request(path: "api/semantic", method: "DELETE")
+            analysis.semanticSearch = try await request(path: "api/semantic", method: "DELETE")
         } catch {
             self.error = error.localizedDescription
         }
@@ -745,7 +767,7 @@ final class AtlasModel: ObservableObject {
     func loadSentimentStatus() async {
         do {
             let status: SentimentStatus = try await request(path: "api/sentiment/status")
-            sentiment = status
+            analysis.sentiment = status
             let analyzedUnits = status.analyzed_turns + status.analyzed_windows
             let shouldLoadTrends = analyzedUnits > 0 && (
                 toneTrends == nil
@@ -772,14 +794,14 @@ final class AtlasModel: ObservableObject {
     }
 
     private func updateToneTrendCheckpoint() {
-        if let sentiment {
+        if let sentiment = analysis.sentiment {
             toneTrendAnalyzedUnits = sentiment.analyzed_turns + sentiment.analyzed_windows
         }
     }
 
     func enableSentimentAnalysis(reportError: Bool = true) async {
         do {
-            sentiment = try await request(path: "api/sentiment/enable", method: "POST", body: [:])
+            analysis.sentiment = try await request(path: "api/sentiment/enable", method: "POST", body: [:])
         } catch {
             if reportError { self.error = error.localizedDescription }
         }
@@ -1010,7 +1032,7 @@ struct AtlasView: View {
     @State private var chatSearchQuery = ""
     @State private var chatSearchResultIndex = 0
     @State private var toneTrendRange: ToneTrendRange = .recent
-    @State private var hoveredEvidencePoint: String?
+    @State private var chatScrollToBottomRequest = 0
     @FocusState private var chatSearchFocused: Bool
     @FocusState private var composerFocused: Bool
     @Namespace private var reasoningToggleAnimation
@@ -1027,12 +1049,22 @@ struct AtlasView: View {
             : Color(red: 0.955, green: 0.94, blue: 0.89)
     }
 
+    private var insightSurface: Color {
+        colorScheme == .dark
+            ? Color.white.opacity(0.075)
+            : Color.white.opacity(0.62)
+    }
+
     var body: some View {
         ZStack(alignment: .top) {
             background.ignoresSafeArea()
             ambientBackground
             if onboardingVersion < currentOnboardingVersion {
-                AtlasOnboardingView(model: model, touchIDEnabled: $touchIDEnabled) {
+                AtlasOnboardingView(
+                    model: model,
+                    analysis: model.analysis,
+                    touchIDEnabled: $touchIDEnabled
+                ) {
                     disclosureAcceptedAt = ISO8601DateFormatter().string(from: Date())
                     onboardingVersion = currentOnboardingVersion
                 }
@@ -1074,9 +1106,9 @@ struct AtlasView: View {
                 async let semantic: Void = model.loadSemanticStatus()
                 async let tone: Void = model.loadSentimentStatus()
                 _ = await (semantic, tone)
-                let phase = model.semanticSearch?.phase ?? ""
-                let textIndexing = model.semanticSearch?.text_index_phase == "indexing"
-                let tonePhase = model.sentiment?.phase ?? ""
+                let phase = model.analysis.semanticSearch?.phase ?? ""
+                let textIndexing = model.analysis.semanticSearch?.text_index_phase == "indexing"
+                let tonePhase = model.analysis.sentiment?.phase ?? ""
                 let delay: Duration = phase == "paused" || tonePhase == "paused"
                     ? .seconds(3)
                     : (textIndexing
@@ -1231,25 +1263,7 @@ struct AtlasView: View {
                     }
                 }
                 .scrollContentBackground(.hidden)
-                if let semantic = model.semanticSearch {
-                    if semantic.text_index_phase == "indexing" {
-                        sidebarTextIndexProgress(semantic)
-                            .padding(.horizontal, 14)
-                            .padding(.bottom, 8)
-                    }
-                }
-                if let sentiment = model.sentiment,
-                   ["downloading", "preparing", "analyzing", "paused", "waiting_for_app"].contains(sentiment.phase) {
-                    sidebarSentimentProgress(sentiment)
-                        .padding(.horizontal, 14)
-                        .padding(.bottom, 8)
-                } else if let semantic = model.semanticSearch,
-                          semantic.text_index_phase != "indexing",
-                          ["downloading", "verifying", "indexing", "embedding", "paused"].contains(semantic.phase) {
-                        sidebarSemanticProgress(semantic)
-                            .padding(.horizontal, 14)
-                            .padding(.bottom, 8)
-                }
+                AtlasSidebarAnalysisProgressView(analysis: model.analysis, accent: accent)
                 HStack {
                     Label(model.status, systemImage: "lock.fill")
                         .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
@@ -1308,6 +1322,7 @@ struct AtlasView: View {
                         }
                     AtlasSettingsView(
                         model: model,
+                        analysis: model.analysis,
                         calendar: model.calendar,
                         touchIDEnabled: $touchIDEnabled,
                         accent: accent,
@@ -1337,114 +1352,6 @@ struct AtlasView: View {
             Spacer()
         }
         .padding(16)
-    }
-
-    private func sidebarSemanticProgress(_ status: SemanticSearchStatus) -> some View {
-        let isDownloading = status.phase == "downloading"
-        let isVerifying = status.phase == "verifying"
-        let isTransfer = isDownloading || isVerifying
-        let isEmbedding = status.phase == "embedding"
-        let isPaused = status.phase == "paused"
-        let usesEmbeddingProgress = isEmbedding || isPaused
-        let completed = isTransfer
-            ? status.downloaded_bytes
-            : Int64(usesEmbeddingProgress ? status.embedded_documents : status.indexed_messages)
-        let total = isTransfer
-            ? status.total_download_bytes
-            : Int64(usesEmbeddingProgress ? status.total_documents : status.total_messages)
-        let fraction = total > 0 ? min(1, Double(completed) / Double(total)) : 0
-        return VStack(alignment: .leading, spacing: 7) {
-            HStack(spacing: 7) {
-                Image(systemName: isTransfer ? "arrow.down.circle" : "sparkles")
-                    .foregroundStyle(accent)
-                Text(isDownloading
-                     ? "Downloading enhanced search…"
-                     : (isVerifying
-                        ? "Verifying enhanced search…"
-                     : (isPaused
-                        ? "Optimization paused"
-                        : (isEmbedding ? "Optimizing model…" : "Preparing enhanced search…"))))
-                    .font(.caption.weight(.semibold)).lineLimit(1)
-                Spacer(minLength: 4)
-                Text(fraction.formatted(.percent.precision(.fractionLength(0))))
-                    .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
-            }
-            ProgressView(value: fraction).tint(accent)
-            if isPaused {
-                Text(atlasPauseText(status.pause_reason))
-                    .font(.caption2).foregroundStyle(.secondary)
-            } else if isEmbedding {
-                Text(status.eta_seconds.map { atlasETAText($0) } ?? "Computing ETA…")
-                    .font(.caption2).foregroundStyle(.secondary)
-            } else if isVerifying {
-                Text("Checking the downloaded file before loading it")
-                    .font(.caption2).foregroundStyle(.secondary)
-            } else if !isDownloading, status.total_messages > 0 {
-                Text("\(status.indexed_messages.formatted()) of \(status.total_messages.formatted()) messages")
-                    .font(.caption2).foregroundStyle(.secondary)
-            }
-        }
-        .padding(11)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 13))
-    }
-
-    private func sidebarSentimentProgress(_ status: SentimentStatus) -> some View {
-        let isDownloading = status.phase == "downloading"
-        let isPaused = ["paused", "waiting_for_app"].contains(status.phase)
-        let completedUnits = status.analyzed_turns + status.analyzed_windows
-        let totalUnits = status.total_turns + status.total_windows
-        let completed = isDownloading ? status.downloaded_bytes : Int64(completedUnits)
-        let total = isDownloading ? status.total_download_bytes : Int64(totalUnits)
-        let fraction = total > 0 ? min(1, Double(completed) / Double(total)) : 0
-        return VStack(alignment: .leading, spacing: 7) {
-            HStack(spacing: 7) {
-                Image(systemName: isDownloading ? "arrow.down.circle" : "waveform.path.ecg")
-                    .foregroundStyle(accent)
-                Text(isDownloading
-                     ? "Downloading tone analysis…"
-                     : (isPaused ? "Tone analysis paused" : "Analyzing conversational tone…"))
-                    .font(.caption.weight(.semibold)).lineLimit(1)
-                Spacer(minLength: 4)
-                Text(fraction.formatted(.percent.precision(.fractionLength(0))))
-                    .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
-            }
-            ProgressView(value: fraction).tint(accent)
-            if ["paused", "waiting_for_app"].contains(status.phase) {
-                Text(atlasPauseText(status.pause_reason))
-                    .font(.caption2).foregroundStyle(.secondary)
-            } else if isDownloading {
-                Text("Runs privately on this Mac after fast search is ready")
-                    .font(.caption2).foregroundStyle(.secondary)
-            } else {
-                Text(status.eta_seconds.map { atlasETAText($0) } ?? "Computing ETA…")
-                    .font(.caption2).foregroundStyle(.secondary)
-            }
-        }
-        .padding(11)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 13))
-    }
-
-    private func sidebarTextIndexProgress(_ status: SemanticSearchStatus) -> some View {
-        let fraction = status.total_messages > 0
-            ? min(1, Double(status.indexed_messages) / Double(status.total_messages))
-            : 0
-        return VStack(alignment: .leading, spacing: 7) {
-            HStack(spacing: 7) {
-                Image(systemName: "text.magnifyingglass").foregroundStyle(accent)
-                Text("Preparing fast search…")
-                    .font(.caption.weight(.semibold)).lineLimit(1)
-                Spacer(minLength: 4)
-                Text(fraction.formatted(.percent.precision(.fractionLength(0))))
-                    .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
-            }
-            ProgressView(value: fraction).tint(accent)
-            if status.total_messages > 0 {
-                Text("\(status.indexed_messages.formatted()) of \(status.total_messages.formatted()) messages")
-                    .font(.caption2).foregroundStyle(.secondary)
-            }
-        }
-        .padding(11)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 13))
     }
 
     @ViewBuilder
@@ -1503,7 +1410,7 @@ struct AtlasView: View {
                     }
                     .padding(16)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+                    .background(insightSurface, in: RoundedRectangle(cornerRadius: 16))
                 } else if model.insights?.status == "refreshing" {
                     HStack(spacing: 12) {
                         ProgressView()
@@ -1519,7 +1426,7 @@ struct AtlasView: View {
                         }
                     }
                     .padding(16).frame(maxWidth: .infinity, alignment: .leading)
-                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+                    .background(insightSurface, in: RoundedRectangle(cornerRadius: 16))
                 }
 
                 if let document = model.insights?.document {
@@ -1552,7 +1459,7 @@ struct AtlasView: View {
                         }
                     }
                     .padding(22).frame(maxWidth: .infinity, alignment: .leading)
-                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 20))
+                    .background(insightSurface, in: RoundedRectangle(cornerRadius: 20))
                 } else if !model.insightsLoading && model.insights?.status != "refreshing" {
                     ContentUnavailableView(
                         "No insights yet",
@@ -1621,7 +1528,7 @@ struct AtlasView: View {
                     .foregroundStyle(.secondary)
                 }
                 .padding(22)
-                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+                .background(insightSurface, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
                 .animation(.smooth(duration: 0.3), value: toneTrendRange)
             }
         }
@@ -1863,7 +1770,7 @@ struct AtlasView: View {
                 }
                 .padding(16)
                 .frame(maxWidth: .infinity, minHeight: 108, alignment: .leading)
-                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+                .background(insightSurface, in: RoundedRectangle(cornerRadius: 16))
             }
             if let direction {
                 directionCard(direction)
@@ -1895,7 +1802,7 @@ struct AtlasView: View {
         }
         .padding(16)
         .frame(maxWidth: .infinity, minHeight: 108, alignment: .leading)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+        .background(insightSurface, in: RoundedRectangle(cornerRadius: 16))
     }
 
     private func directionLegend(_ label: String, value: Double, color: Color) -> some View {
@@ -1978,10 +1885,7 @@ struct AtlasView: View {
             }
         }
         .padding(22)
-        .background(
-            .regularMaterial,
-            in: RoundedRectangle(cornerRadius: 20, style: .continuous)
-        )
+        .background(insightSurface, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
     }
 
     private func evidenceGroup(
@@ -2043,44 +1947,12 @@ struct AtlasView: View {
             VStack(alignment: .leading, spacing: 9) {
                 Text("EVIDENCE").font(.caption2.bold()).tracking(1).foregroundStyle(.secondary)
                 ForEach(theme.evidence, id: \.self) { item in
-                    let evidenceID = "\(theme.id):\(item)"
-                    Button {
+                    InsightEvidenceButton(text: item, color: color, isDisabled: model.isSending) {
                         withAnimation(.smooth(duration: 0.3)) {
                             model.exploreInsight(theme: theme, evidence: item)
                         }
                         DispatchQueue.main.async { composerFocused = true }
-                    } label: {
-                        HStack(alignment: .top, spacing: 9) {
-                            Image(systemName: "plus")
-                                .font(.caption2.bold())
-                                .foregroundStyle(color)
-                                .padding(.top, 3)
-                            Text(item)
-                                .font(.callout)
-                                .foregroundStyle(.secondary)
-                                .multilineTextAlignment(.leading)
-                            Spacer(minLength: 6)
-                            Image(systemName: "bubble.left.and.text.bubble.right")
-                                .font(.caption)
-                                .foregroundStyle(
-                                    hoveredEvidencePoint == evidenceID ? color : Color.secondary.opacity(0.55)
-                                )
-                                .padding(.top, 2)
-                        }
-                        .padding(8)
-                        .background(
-                            color.opacity(hoveredEvidencePoint == evidenceID ? 0.10 : 0),
-                            in: RoundedRectangle(cornerRadius: 9)
-                        )
                     }
-                    .buttonStyle(.plain)
-                    .disabled(model.isSending)
-                    .onHover { hovering in
-                        withAnimation(.easeOut(duration: 0.14)) {
-                            hoveredEvidencePoint = hovering ? evidenceID : nil
-                        }
-                    }
-                    .help("Chat about this evidence")
                 }
             }
 
@@ -2099,10 +1971,7 @@ struct AtlasView: View {
         }
         .padding(20)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .background(
-            .regularMaterial,
-            in: RoundedRectangle(cornerRadius: 20, style: .continuous)
-        )
+        .background(insightSurface, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 20).stroke(color.opacity(0.16), lineWidth: 1))
     }
 
@@ -2249,9 +2118,26 @@ struct AtlasView: View {
                             }
                         })
                     }
+                    .onAppear {
+                        chatFollowsLiveOutput = true
+                        DispatchQueue.main.async {
+                            proxy.scrollTo("chat-bottom", anchor: .bottom)
+                        }
+                    }
                     .onChange(of: model.selection) { _, _ in
                         chatFollowsLiveOutput = true
                         closeChatSearch(animated: false)
+                        DispatchQueue.main.async {
+                            proxy.scrollTo("chat-bottom", anchor: .bottom)
+                        }
+                    }
+                    .onChange(of: chatScrollToBottomRequest) { _, _ in
+                        chatFollowsLiveOutput = true
+                        DispatchQueue.main.async {
+                            withAnimation(.smooth(duration: 0.24)) {
+                                proxy.scrollTo("chat-bottom", anchor: .bottom)
+                            }
+                        }
                     }
                     .onChange(of: selectedChatSearchResult) { _, result in
                         guard let result else { return }
@@ -2770,6 +2656,8 @@ struct AtlasView: View {
         if isDirectEvidenceExploration {
             model.prompt = "Dig deeper into this evidence."
         }
+        chatFollowsLiveOutput = true
+        chatScrollToBottomRequest &+= 1
         Task { await model.send(responseProfile: responseProfile) }
     }
 
@@ -2963,8 +2851,179 @@ struct AtlasView: View {
     }
 }
 
+private struct InsightEvidenceButton: View {
+    let text: String
+    let color: Color
+    let isDisabled: Bool
+    let action: () -> Void
+    @State private var isHovered = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(alignment: .top, spacing: 9) {
+                Image(systemName: "plus")
+                    .font(.caption2.bold())
+                    .foregroundStyle(color)
+                    .padding(.top, 3)
+                Text(text)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.leading)
+                Spacer(minLength: 6)
+                Image(systemName: "bubble.left.and.text.bubble.right")
+                    .font(.caption)
+                    .foregroundStyle(isHovered ? color : Color.secondary.opacity(0.55))
+                    .padding(.top, 2)
+            }
+            .padding(8)
+            .background(
+                color.opacity(isHovered ? 0.10 : 0),
+                in: RoundedRectangle(cornerRadius: 9)
+            )
+        }
+        .buttonStyle(.plain)
+        .disabled(isDisabled)
+        .onHover { hovering in
+            withAnimation(.easeOut(duration: 0.14)) { isHovered = hovering }
+        }
+        .help("Chat about this evidence")
+    }
+}
+
+private struct AtlasSidebarAnalysisProgressView: View {
+    @ObservedObject var analysis: AtlasAnalysisState
+    let accent: Color
+
+    var body: some View {
+        Group {
+            if let semantic = analysis.semanticSearch, semantic.text_index_phase == "indexing" {
+                textIndexProgress(semantic)
+            }
+            if let sentiment = analysis.sentiment,
+               ["downloading", "preparing", "analyzing", "paused", "waiting_for_app"].contains(sentiment.phase) {
+                sentimentProgress(sentiment)
+            } else if let semantic = analysis.semanticSearch,
+                      semantic.text_index_phase != "indexing",
+                      ["downloading", "verifying", "indexing", "embedding", "paused"].contains(semantic.phase) {
+                semanticProgress(semantic)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.bottom, 8)
+    }
+
+    private func semanticProgress(_ status: SemanticSearchStatus) -> some View {
+        let isDownloading = status.phase == "downloading"
+        let isVerifying = status.phase == "verifying"
+        let isTransfer = isDownloading || isVerifying
+        let isEmbedding = status.phase == "embedding"
+        let isPaused = status.phase == "paused"
+        let usesEmbeddingProgress = isEmbedding || isPaused
+        let completed = isTransfer
+            ? status.downloaded_bytes
+            : Int64(usesEmbeddingProgress ? status.embedded_documents : status.indexed_messages)
+        let total = isTransfer
+            ? status.total_download_bytes
+            : Int64(usesEmbeddingProgress ? status.total_documents : status.total_messages)
+        let fraction = total > 0 ? min(1, Double(completed) / Double(total)) : 0
+        return VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 7) {
+                Image(systemName: isTransfer ? "arrow.down.circle" : "sparkles")
+                    .foregroundStyle(accent)
+                Text(isDownloading
+                     ? "Downloading enhanced search…"
+                     : (isVerifying
+                        ? "Verifying enhanced search…"
+                     : (isPaused
+                        ? "Optimization paused"
+                        : (isEmbedding ? "Optimizing model…" : "Preparing enhanced search…"))))
+                    .font(.caption.weight(.semibold)).lineLimit(1)
+                Spacer(minLength: 4)
+                Text(fraction.formatted(.percent.precision(.fractionLength(0))))
+                    .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+            }
+            ProgressView(value: fraction).tint(accent)
+            if isPaused {
+                Text(atlasPauseText(status.pause_reason))
+                    .font(.caption2).foregroundStyle(.secondary)
+            } else if isEmbedding {
+                Text(status.eta_seconds.map { atlasETAText($0) } ?? "Computing ETA…")
+                    .font(.caption2).foregroundStyle(.secondary)
+            } else if isVerifying {
+                Text("Checking the downloaded file before loading it")
+                    .font(.caption2).foregroundStyle(.secondary)
+            } else if !isDownloading, status.total_messages > 0 {
+                Text("\(status.indexed_messages.formatted()) of \(status.total_messages.formatted()) messages")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+        .padding(11)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 13))
+    }
+
+    private func sentimentProgress(_ status: SentimentStatus) -> some View {
+        let isDownloading = status.phase == "downloading"
+        let isPaused = ["paused", "waiting_for_app"].contains(status.phase)
+        let completedUnits = status.analyzed_turns + status.analyzed_windows
+        let totalUnits = status.total_turns + status.total_windows
+        let completed = isDownloading ? status.downloaded_bytes : Int64(completedUnits)
+        let total = isDownloading ? status.total_download_bytes : Int64(totalUnits)
+        let fraction = total > 0 ? min(1, Double(completed) / Double(total)) : 0
+        return VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 7) {
+                Image(systemName: isDownloading ? "arrow.down.circle" : "waveform.path.ecg")
+                    .foregroundStyle(accent)
+                Text(isDownloading
+                     ? "Downloading tone analysis…"
+                     : (isPaused ? "Tone analysis paused" : "Analyzing conversational tone…"))
+                    .font(.caption.weight(.semibold)).lineLimit(1)
+                Spacer(minLength: 4)
+                Text(fraction.formatted(.percent.precision(.fractionLength(0))))
+                    .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+            }
+            ProgressView(value: fraction).tint(accent)
+            if isPaused {
+                Text(atlasPauseText(status.pause_reason))
+                    .font(.caption2).foregroundStyle(.secondary)
+            } else if isDownloading {
+                Text("Runs privately on this Mac after fast search is ready")
+                    .font(.caption2).foregroundStyle(.secondary)
+            } else {
+                Text(status.eta_seconds.map { atlasETAText($0) } ?? "Computing ETA…")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+        .padding(11)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 13))
+    }
+
+    private func textIndexProgress(_ status: SemanticSearchStatus) -> some View {
+        let fraction = status.total_messages > 0
+            ? min(1, Double(status.indexed_messages) / Double(status.total_messages))
+            : 0
+        return VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 7) {
+                Image(systemName: "text.magnifyingglass").foregroundStyle(accent)
+                Text("Preparing fast search…")
+                    .font(.caption.weight(.semibold)).lineLimit(1)
+                Spacer(minLength: 4)
+                Text(fraction.formatted(.percent.precision(.fractionLength(0))))
+                    .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+            }
+            ProgressView(value: fraction).tint(accent)
+            if status.total_messages > 0 {
+                Text("\(status.indexed_messages.formatted()) of \(status.total_messages.formatted()) messages")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+        .padding(11)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 13))
+    }
+}
+
 private struct AtlasSettingsView: View {
     @ObservedObject var model: AtlasModel
+    @ObservedObject var analysis: AtlasAnalysisState
     @ObservedObject var calendar: AtlasCalendarBridge
     @Binding var touchIDEnabled: Bool
     let accent: Color
@@ -2972,7 +3031,7 @@ private struct AtlasSettingsView: View {
     let showOnboarding: () -> Void
     @State private var confirmRemoval = false
 
-    private var status: SemanticSearchStatus? { model.semanticSearch }
+    private var status: SemanticSearchStatus? { analysis.semanticSearch }
 
     private var downloadProgress: Double {
         guard let status, status.total_download_bytes > 0 else { return 0 }
@@ -3051,8 +3110,8 @@ private struct AtlasSettingsView: View {
             await calendar.refresh()
             await model.loadSemanticStatus()
             while !Task.isCancelled {
-                let active = model.semanticSearch?.text_index_phase == "indexing"
-                    || ["downloading", "verifying", "indexing", "embedding"].contains(model.semanticSearch?.phase ?? "")
+                let active = analysis.semanticSearch?.text_index_phase == "indexing"
+                    || ["downloading", "verifying", "indexing", "embedding"].contains(analysis.semanticSearch?.phase ?? "")
                 try? await Task.sleep(for: active ? .milliseconds(600) : .seconds(3))
                 await model.loadSemanticStatus()
             }
@@ -3344,6 +3403,7 @@ private struct AtlasBrandMark: View {
 
 private struct AtlasOnboardingView: View {
     @ObservedObject var model: AtlasModel
+    @ObservedObject var analysis: AtlasAnalysisState
     @Binding var touchIDEnabled: Bool
     let onComplete: () -> Void
 
@@ -3461,9 +3521,9 @@ private struct AtlasOnboardingView: View {
                 async let toneRefresh: Void = model.loadSentimentStatus()
                 _ = await (semanticRefresh, toneRefresh)
                 let working = ["downloading", "preparing", "analyzing", "paused", "waiting_for_app"]
-                    .contains(model.sentiment?.phase ?? "")
+                    .contains(analysis.sentiment?.phase ?? "")
                     || ["downloading", "verifying", "indexing", "embedding", "paused"]
-                    .contains(model.semanticSearch?.phase ?? "")
+                    .contains(analysis.semanticSearch?.phase ?? "")
                 try? await Task.sleep(for: working ? .milliseconds(650) : .seconds(3))
             }
         }
@@ -3479,7 +3539,7 @@ private struct AtlasOnboardingView: View {
 
     private var canContinue: Bool {
         if page == 2 { return acceptedDisclosure && !recordingDisclosure }
-        if page == 3 { return model.sentiment?.installed == true }
+        if page == 3 { return analysis.sentiment?.installed == true }
         if page == 4 {
             return model.fullDiskAccessReady && model.codexInstalled && model.codexLoggedIn
         }
@@ -3620,13 +3680,13 @@ private struct AtlasOnboardingView: View {
                             .fixedSize(horizontal: false, vertical: true)
                     }
                     Spacer()
-                    if model.sentiment?.installed == true {
+                    if analysis.sentiment?.installed == true {
                         Label("Ready", systemImage: "checkmark.circle.fill")
                             .font(.subheadline.weight(.semibold)).foregroundStyle(.green)
                     }
                 }
 
-                if let tone = model.sentiment {
+                if let tone = analysis.sentiment {
                     if tone.phase == "downloading" {
                         HStack {
                             Text("Downloading…").font(.caption.weight(.semibold))
@@ -3673,7 +3733,7 @@ private struct AtlasOnboardingView: View {
                     }
                     Spacer()
                     Toggle("", isOn: Binding(
-                        get: { model.semanticSearch?.enabled == true },
+                        get: { analysis.semanticSearch?.enabled == true },
                         set: { enabled in
                             Task {
                                 if enabled { await model.enableSemanticSearch() }
@@ -3684,7 +3744,7 @@ private struct AtlasOnboardingView: View {
                     .labelsHidden().toggleStyle(.switch)
                 }
 
-                if let semantic = model.semanticSearch, semantic.enabled {
+                if let semantic = analysis.semanticSearch, semantic.enabled {
                     if semantic.phase == "downloading" {
                         HStack {
                             Text("Downloading…").font(.caption.weight(.semibold))

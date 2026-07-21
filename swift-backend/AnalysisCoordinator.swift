@@ -25,12 +25,14 @@ extension AtlasRuntime {
 
     func insightsResponse() throws -> JSONValue {
         var snapshot = try history.getInsights()
-        let messageCount = try messages.info().messages
-        let changedBy = messageCount - snapshot.source_message_count
-        let age: TimeInterval = snapshot.updated_at.flatMap(parseAtlasDate).map { Date().timeIntervalSince($0) } ?? .infinity
-        if snapshot.status != "refreshing" && (snapshot.format_version != 4 || snapshot.content == nil || changedBy >= 250 || (changedBy > 0 && age > 86_400)) {
-            refreshInsights()
-            snapshot.status = "refreshing"
+        let messageCount = try? messages.info().messages
+        if let messageCount {
+            let changedBy = messageCount - snapshot.source_message_count
+            let age: TimeInterval = snapshot.updated_at.flatMap(parseAtlasDate).map { Date().timeIntervalSince($0) } ?? .infinity
+            if snapshot.status != "refreshing" && (snapshot.format_version != 4 || snapshot.content == nil || changedBy >= 250 || (changedBy > 0 && age > 86_400)) {
+                refreshInsights()
+                snapshot.status = "refreshing"
+            }
         }
         var document: JSONValue = .null
         if snapshot.format_version == 4, let content = snapshot.content,
@@ -38,16 +40,20 @@ extension AtlasRuntime {
             document = decoded
             if case .object(var object) = document {
                 if case .array(let metrics) = object["metrics"] {
-                    object["metrics"] = .array(metrics.filter { !$0["label"]!.stringValue!.lowercased().contains("direction") })
+                    object["metrics"] = .array(metrics.filter {
+                        !($0["label"]?.stringValue?.lowercased().contains("direction") ?? false)
+                    })
                 }
-                let totals = try messages.conversationStats()["totals"]
-                let sent = totals?["from_me"]?.intValue ?? 0, received = totals?["to_me"]?.intValue ?? 0
-                let total = sent + received
-                object["direction"] = .object([
-                    "sent_count": .number(Double(sent)), "received_count": .number(Double(received)),
-                    "sent_percent": .number(total > 0 ? Double(sent) * 100 / Double(total) : 0),
-                    "received_percent": .number(total > 0 ? Double(received) * 100 / Double(total) : 0),
-                ])
+                if let stats = try? messages.conversationStats(), let totals = stats["totals"] {
+                    let sent = totals["from_me"]?.intValue ?? 0
+                    let received = totals["to_me"]?.intValue ?? 0
+                    let total = sent + received
+                    object["direction"] = .object([
+                        "sent_count": .number(Double(sent)), "received_count": .number(Double(received)),
+                        "sent_percent": .number(total > 0 ? Double(sent) * 100 / Double(total) : 0),
+                        "received_percent": .number(total > 0 ? Double(received) * 100 / Double(total) : 0),
+                    ])
+                }
                 document = .object(object)
             }
         }
@@ -57,7 +63,7 @@ extension AtlasRuntime {
             "status": .string(snapshot.status), "error": snapshot.error.map(JSONValue.string) ?? .null,
             "updated_at": snapshot.updated_at.map(JSONValue.string) ?? .null,
             "format_version": .number(Double(snapshot.format_version)), "document": document,
-            "current_message_count": .number(Double(messageCount)),
+            "current_message_count": .number(Double(messageCount ?? snapshot.source_message_count)),
         ])
     }
 
