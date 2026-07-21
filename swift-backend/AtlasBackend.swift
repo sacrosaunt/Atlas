@@ -22,7 +22,7 @@ struct AtlasBackendMain {
             Task.detached {
                 while true {
                     try? await Task.sleep(for: .seconds(2))
-                    if Darwin.getppid() != parentPID { Darwin.exit(0) }
+                    if Darwin.getppid() != parentPID { Darwin._exit(0) }
                 }
             }
         }
@@ -208,7 +208,7 @@ private func mountCoreRoutes(_ router: Router<BasicRequestContext>, runtime: Atl
         guard await runtime.authorized(request) else { return try atlasUnauthorized() }
         Task {
             try? await Task.sleep(for: .milliseconds(150))
-            Darwin.exit(75)
+            Darwin._exit(75)
         }
         return try atlasResponse(.object(["restarting": .bool(true)]))
     }

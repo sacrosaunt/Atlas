@@ -40,7 +40,7 @@ final class EmbeddingEngine: @unchecked Sendable {
             guard let pointer else { return false }
             return Unmanaged<EmbeddingCancellation>.fromOpaque(pointer).takeUnretainedValue().isCancelled
         }, cancellationPointer)
-        dimensions = Int(llama_model_n_embd(model))
+        dimensions = Int(llama_model_n_embd_out(model))
         cancellation.reset()
     }
 
@@ -63,9 +63,10 @@ final class EmbeddingEngine: @unchecked Sendable {
             guard count > 0 else { throw EmbeddingError.tokenize }
             return Array(tokens.prefix(Int(count)).prefix(2_040))
         }
+        llama_memory_clear(llama_get_memory(context), true)
         let result = tokens.withUnsafeMutableBufferPointer { pointer -> Int32 in
             let batch = llama_batch_get_one(pointer.baseAddress, Int32(pointer.count))
-            return llama_encode(context, batch)
+            return llama_decode(context, batch)
         }
         if cancellation.isCancelled { throw CancellationError() }
         guard result == 0, let raw = llama_get_embeddings_seq(context, 0) ?? llama_get_embeddings(context) else {

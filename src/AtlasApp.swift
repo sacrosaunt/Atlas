@@ -376,7 +376,6 @@ final class AtlasModel: ObservableObject {
     @Published var setupReachable = false
     @Published var codexInstalled = false
     @Published var codexLoggedIn = false
-    @Published var codexPath: String?
     @Published var codexInstallCommand = "npm install --global @openai/codex"
     @Published var codexLoginCommand = "codex login"
     @Published var semanticSearch: SemanticSearchStatus?
@@ -395,6 +394,7 @@ final class AtlasModel: ObservableObject {
     private var authContext: LAContext?
     private var observedFirstInsightsPending = false
     private var toneTrendAnalyzedUnits = -1
+    private var setupCheckGeneration = 0
 
     func unlock() async {
         guard lockState != .unlocking else { return }
@@ -471,26 +471,29 @@ final class AtlasModel: ObservableObject {
     }
 
     func checkSetup() async {
+        setupCheckGeneration += 1
+        let generation = setupCheckGeneration
         do {
             let (data, response) = try await URLSession.shared.data(from: serviceURL.appending(path: "api/setup"))
             guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
                 throw URLError(.badServerResponse)
             }
             let setup = try JSONDecoder().decode(SetupResponse.self, from: data)
+            guard generation == setupCheckGeneration else { return }
             setupReachable = true
             fullDiskAccessReady = setup.full_disk_access
             fullDiskAccessError = setup.full_disk_access_error
             serviceExecutable = setup.service_executable
             codexInstalled = setup.codex_installed
             codexLoggedIn = setup.codex_logged_in
-            codexPath = setup.codex_path
             codexInstallCommand = setup.install_command
             codexLoginCommand = setup.login_command
         } catch {
+            guard generation == setupCheckGeneration else { return }
             setupReachable = false
-            fullDiskAccessReady = false
-            codexInstalled = false
-            codexLoggedIn = false
+            // A backend restart or brief connection gap is not evidence that a
+            // previously confirmed permission was revoked. The next successful
+            // response remains authoritative for each setup check.
         }
     }
 
@@ -774,11 +777,11 @@ final class AtlasModel: ObservableObject {
         }
     }
 
-    func enableSentimentAnalysis() async {
+    func enableSentimentAnalysis(reportError: Bool = true) async {
         do {
             sentiment = try await request(path: "api/sentiment/enable", method: "POST", body: [:])
         } catch {
-            self.error = error.localizedDescription
+            if reportError { self.error = error.localizedDescription }
         }
     }
 
@@ -1185,6 +1188,7 @@ struct AtlasView: View {
             }
         }
         .padding(60)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
     }
 
     private var mainView: some View {
@@ -3347,6 +3351,8 @@ private struct AtlasOnboardingView: View {
     @State private var page = 0
     @State private var acceptedDisclosure = false
     @State private var recordingDisclosure = false
+    @State private var disclosureError: String?
+    @State private var preparingPermissions = false
     @State private var navigationDirection = 1
 
     private var accent: Color {
@@ -3405,24 +3411,38 @@ private struct AtlasOnboardingView: View {
                     if page < 4 {
                         if page == 2 {
                             recordingDisclosure = true
+                            disclosureError = nil
                             Task {
                                 if await model.acceptDisclosure() {
                                     navigationDirection = 1
                                     withAnimation(.smooth(duration: 0.36)) { page += 1 }
+                                } else {
+                                    disclosureError = "Atlas couldn't reach its local service. Try again in a moment."
                                 }
                                 recordingDisclosure = false
+                            }
+                        } else if page == 3 {
+                            preparingPermissions = true
+                            Task {
+                                await model.checkSetup()
+                                guard page == 3 else {
+                                    preparingPermissions = false
+                                    return
+                                }
+                                navigationDirection = 1
+                                withAnimation(.smooth(duration: 0.36)) { page += 1 }
+                                preparingPermissions = false
                             }
                         } else {
                             navigationDirection = 1
                             withAnimation(.smooth(duration: 0.36)) { page += 1 }
-                            if page == 4 { Task { await model.checkSetup() } }
                         }
                     } else {
                         onComplete()
                     }
                 }
                 .buttonStyle(.borderedProminent).controlSize(.large).tint(accent)
-                .disabled(!canContinue)
+                .disabled(!canContinue || preparingPermissions)
             }
             .padding(.top, 24)
         }
@@ -3430,10 +3450,11 @@ private struct AtlasOnboardingView: View {
         .frame(maxWidth: 980, maxHeight: 760)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 28))
         .padding(34)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
         .task {
             async let setup: Void = model.checkSetup()
             async let semantic: Void = model.loadSemanticStatus()
-            async let tone: Void = model.enableSentimentAnalysis()
+            async let tone: Void = model.enableSentimentAnalysis(reportError: false)
             _ = await (setup, semantic, tone)
             while !Task.isCancelled {
                 async let semanticRefresh: Void = model.loadSemanticStatus()
@@ -3449,8 +3470,9 @@ private struct AtlasOnboardingView: View {
         .task(id: page) {
             guard page == 4 else { return }
             while !Task.isCancelled && page == 4 {
-                await model.checkSetup()
                 try? await Task.sleep(for: .seconds(3))
+                guard !Task.isCancelled && page == 4 else { return }
+                await model.checkSetup()
             }
         }
     }
@@ -3486,14 +3508,13 @@ private struct AtlasOnboardingView: View {
     }
 
     private var howItWorksPage: some View {
-        VStack(alignment: .leading, spacing: 26) {
+        VStack(alignment: .leading, spacing: 24) {
             VStack(alignment: .leading, spacing: 7) {
                 Text("How Atlas works")
                     .font(.system(size: 38, weight: .medium, design: .serif))
                 Text("Ask naturally. Atlas handles the searching and keeps the answer grounded in what was actually said.")
                     .font(.title3).foregroundStyle(.secondary)
             }
-            Spacer()
             HStack(spacing: 10) {
                 flowNode("You ask", icon: "text.bubble.fill", detail: "A question about a person, promise, or pattern")
                 Image(systemName: "arrow.right").foregroundStyle(.secondary)
@@ -3503,7 +3524,6 @@ private struct AtlasOnboardingView: View {
                 Image(systemName: "arrow.right").foregroundStyle(.secondary)
                 flowNode("You decide", icon: "checkmark.bubble.fill", detail: "Get a clear answer without changing any messages")
             }
-            Spacer()
             Label(
                 "Atlas can read relevant conversations, but it cannot message anyone, edit your history, or delete anything. The next screen explains what data is sent to OpenAI.",
                 systemImage: "lock.shield"
@@ -3511,6 +3531,7 @@ private struct AtlasOnboardingView: View {
             .font(.callout).foregroundStyle(.secondary)
             .padding(16).background(accent.opacity(0.09), in: RoundedRectangle(cornerRadius: 14))
         }
+        .frame(maxHeight: .infinity, alignment: .center)
     }
 
     private var disclosurePage: some View {
@@ -3573,10 +3594,7 @@ private struct AtlasOnboardingView: View {
             .background(acceptedDisclosure ? accent.opacity(0.10) : Color.secondary.opacity(0.07),
                         in: RoundedRectangle(cornerRadius: 13))
 
-            if recordingDisclosure {
-                Label("Recording your approval…", systemImage: "lock.shield")
-                    .font(.caption).foregroundStyle(.secondary)
-            } else if let error = model.error {
+            if let error = disclosureError {
                 Text(error).font(.caption).foregroundStyle(.red)
             }
         }
@@ -3741,8 +3759,9 @@ private struct AtlasOnboardingView: View {
 
             setupRow(
                 title: "Codex CLI",
-                detail: model.codexPath.map { "Found at \($0)" }
-                    ?? "Atlas checks your PATH and common package-manager locations.",
+                detail: model.codexInstalled
+                    ? "Codex is installed and available to Atlas."
+                    : "Atlas checks your shell and common installation locations.",
                 ready: model.codexInstalled,
                 readyText: "Installed",
                 missingText: "Not found"
