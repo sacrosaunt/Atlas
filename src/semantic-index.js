@@ -270,7 +270,7 @@ export class SemanticIndex {
       text_index_error: this.textError,
       pause_reason: this.phase === "paused" ? this.powerState.reason : null,
       preventing_sleep: Boolean(this.sleepAssertionProcess),
-      downloaded_bytes: this.phase === "downloading"
+      downloaded_bytes: ["downloading", "verifying"].includes(this.phase)
         ? this.downloadedBytes
         : (this.isModelInstalled() ? MODEL_BYTES : bytesOnDisk(this.partialModelPath)),
       total_download_bytes: MODEL_BYTES,
@@ -409,8 +409,15 @@ export class SemanticIndex {
       rmSync(this.partialModelPath, { force: true });
       throw new Error("The downloaded search component had an unexpected size");
     }
+    this.phase = "verifying";
     const hash = createHash("sha256");
-    for await (const chunk of createReadStream(this.partialModelPath)) hash.update(chunk);
+    for await (const chunk of createReadStream(this.partialModelPath)) {
+      if (signal.aborted) {
+        rmSync(this.partialModelPath, { force: true });
+        throw new DOMException("Download cancelled", "AbortError");
+      }
+      hash.update(chunk);
+    }
     if (hash.digest("hex") !== MODEL_SHA256) {
       rmSync(this.partialModelPath, { force: true });
       throw new Error("The downloaded search component could not be verified");

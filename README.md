@@ -138,6 +138,12 @@ Grant Full Disk Access in:
 System Settings > Privacy & Security > Full Disk Access
 ```
 
+Onboarding displays the exact Node executable used by the Login Agent. After
+granting it Full Disk Access, use **Restart & Recheck** in Atlas; restarting the
+window alone does not restart the separate background process. Codex is
+resolved dynamically from `CODEX_CLI_PATH`, the service `PATH`, the active Node
+bin, and common Homebrew, NVM, Volta, npm, asdf, and mise locations.
+
 ## Install
 
 ```sh

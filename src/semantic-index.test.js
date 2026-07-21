@@ -55,6 +55,22 @@ test("enhanced search is disabled and does not download by default", async () =>
   }
 });
 
+test("completed download bytes remain visible during verification", async () => {
+  const fixture = temporaryIndex();
+  try {
+    writeFileSync(fixture.index.partialModelPath, "", { mode: 0o600 });
+    truncateSync(fixture.index.partialModelPath, MODEL_BYTES);
+    fixture.index.phase = "verifying";
+    fixture.index.downloadedBytes = MODEL_BYTES;
+    const status = fixture.index.status();
+    assert.equal(status.phase, "verifying");
+    assert.equal(status.installed, false);
+    assert.equal(status.downloaded_bytes, MODEL_BYTES);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 test("background indexing creates private chunks that hybrid search can filter", async () => {
   const messages = Array.from({ length: 10 }, (_, index) => ({
     message_id: index + 1,

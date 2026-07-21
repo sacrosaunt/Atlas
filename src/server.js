@@ -14,6 +14,7 @@ import { IMessageStore } from "./imessage.js";
 import { mountMcp } from "./mcp.js";
 import { SemanticIndex } from "./semantic-index.js";
 import { SentimentIndex } from "./sentiment-index.js";
+import { resolveCodexPath } from "./codex-discovery.js";
 
 process.umask(0o077);
 
@@ -23,9 +24,6 @@ const stateDirectory = join(homedir(), "Library", "Application Support", "Atlas"
 const tokenPath = join(stateDirectory, "mcp-token");
 const identityKeyPath = join(stateDirectory, "identity-key");
 const starterSuggestionsCachePath = join(stateDirectory, "starter-suggestions.json");
-const codexPath = process.env.CODEX_CLI_PATH
-  ?? join(homedir(), ".nvm", "versions", "node", "v24.8.0", "bin", "codex");
-
 function loadToken() {
   mkdirSync(stateDirectory, { recursive: true, mode: 0o700 });
   if (existsSync(tokenPath)) return readFileSync(tokenPath, "utf8").trim();
@@ -283,11 +281,13 @@ function readResponseProfile(req) {
 }
 
 function codexOptions(prompt, onActivity, responseProfile = "deeper") {
+  const codexPath = resolveCodexPath();
   return {
     prompt,
     token,
     mcpUrl: `http://${HOST}:${PORT}/mcp`,
     onActivity,
+    ...(codexPath ? { codexPath } : {}),
     ...RESPONSE_PROFILES[responseProfile],
   };
 }
@@ -627,14 +627,17 @@ app.get("/api/health", (_req, res) => {
 
 app.get("/api/setup", (_req, res) => {
   let fullDiskAccess = false;
+  let fullDiskAccessError = null;
   try {
     store.info();
     fullDiskAccess = true;
-  } catch {
+  } catch (error) {
     fullDiskAccess = false;
+    fullDiskAccessError = error instanceof Error ? error.message : String(error);
   }
 
-  const codexInstalled = existsSync(codexPath);
+  const codexPath = resolveCodexPath();
+  const codexInstalled = Boolean(codexPath);
   let codexLoggedIn = false;
   if (codexInstalled) {
     const login = spawnSync(codexPath, ["login", "status"], {
@@ -647,11 +650,20 @@ app.get("/api/setup", (_req, res) => {
 
   res.json({
     full_disk_access: fullDiskAccess,
+    full_disk_access_error: fullDiskAccessError,
     codex_installed: codexInstalled,
     codex_logged_in: codexLoggedIn,
+    codex_path: codexPath,
+    service_executable: process.execPath,
     install_command: "npm install --global @openai/codex",
     login_command: "codex login",
   });
+});
+
+app.post("/api/restart", (req, res) => {
+  if (!requireApp(req, res)) return;
+  res.json({ restarting: true });
+  setTimeout(() => { void shutdown(75); }, 150);
 });
 
 app.get("/api/semantic/status", (req, res) => {
@@ -899,13 +911,13 @@ const httpServer = app.listen(PORT, HOST, () => {
   console.log(`Atlas is listening at http://${HOST}:${PORT}`);
 });
 
-async function shutdown() {
+async function shutdown(exitCode = 0) {
   httpServer.close();
   await closeMcp();
   await sentimentIndex.close();
   await semanticIndex.close();
-  process.exit(0);
+  process.exit(exitCode);
 }
 
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
+process.on("SIGINT", () => { void shutdown(); });
+process.on("SIGTERM", () => { void shutdown(); });

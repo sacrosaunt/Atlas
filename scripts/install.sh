@@ -13,7 +13,9 @@ if (( node_major < 22 )); then
 fi
 node_dir="$(dirname "$node_bin")"
 npm_cli="$node_dir/../lib/node_modules/npm/bin/npm-cli.js"
-codex_cli="${CODEX_CLI_PATH:-$node_dir/codex}"
+codex_cli="${CODEX_CLI_PATH:-}"
+if [[ -z "$codex_cli" ]]; then codex_cli="$(command -v codex 2>/dev/null || true)"; fi
+service_path="$node_dir:$atlas_home_dir/.local/bin:$atlas_home_dir/.npm-global/bin:$atlas_home_dir/.volta/bin:$atlas_home_dir/.asdf/shims:$atlas_home_dir/.local/share/mise/shims:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 agent_source="$project_dir/config/com.sacrosaunt.atlas.plist.template"
 agent_target="$atlas_home_dir/Library/LaunchAgents/com.sacrosaunt.atlas.plist"
 app_target="$atlas_home_dir/Applications/Atlas.app"
@@ -32,6 +34,7 @@ mkdir -p "$project_dir/bin" "$atlas_home_dir/Library/LaunchAgents" "$atlas_home_
 /usr/bin/sed \
   -e "s|__NODE_BIN__|$node_bin|g" \
   -e "s|__NODE_DIR__|$node_dir|g" \
+  -e "s|__SERVICE_PATH__|$service_path|g" \
   -e "s|__CODEX_CLI__|$codex_cli|g" \
   -e "s|__PROJECT_DIR__|$project_dir|g" \
   -e "s|__ATLAS_HOME__|$atlas_home_dir|g" \

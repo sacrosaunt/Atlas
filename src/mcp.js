@@ -34,7 +34,7 @@ function errorResult(error) {
 
 export function createAtlasMcp(store, semanticIndex, sentimentIndex) {
   const server = new McpServer(
-    { name: "Atlas iMessage", version: "0.4.0" },
+    { name: "Atlas iMessage", version: "0.4.1" },
     {
       instructions: [
         "Atlas provides read-only access to your local iMessage database.",

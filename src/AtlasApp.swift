@@ -22,11 +22,15 @@ private struct SuggestionResponse: Decodable {
 }
 private struct SetupResponse: Decodable {
     let full_disk_access: Bool
+    let full_disk_access_error: String?
     let codex_installed: Bool
     let codex_logged_in: Bool
+    let codex_path: String?
+    let service_executable: String
     let install_command: String
     let login_command: String
 }
+private struct RestartResponse: Decodable { let restarting: Bool }
 
 struct SemanticSearchStatus: Decodable, Equatable {
     let enabled: Bool
@@ -251,8 +255,12 @@ final class AtlasModel: ObservableObject {
     @Published var chatActivity: ChatActivity?
     @Published var status = "Checking local service…"
     @Published var fullDiskAccessReady = false
+    @Published var fullDiskAccessError: String?
+    @Published var serviceExecutable = ""
+    @Published var setupReachable = false
     @Published var codexInstalled = false
     @Published var codexLoggedIn = false
+    @Published var codexPath: String?
     @Published var codexInstallCommand = "npm install --global @openai/codex"
     @Published var codexLoginCommand = "codex login"
     @Published var semanticSearch: SemanticSearchStatus?
@@ -342,15 +350,34 @@ final class AtlasModel: ObservableObject {
                 throw URLError(.badServerResponse)
             }
             let setup = try JSONDecoder().decode(SetupResponse.self, from: data)
+            setupReachable = true
             fullDiskAccessReady = setup.full_disk_access
+            fullDiskAccessError = setup.full_disk_access_error
+            serviceExecutable = setup.service_executable
             codexInstalled = setup.codex_installed
             codexLoggedIn = setup.codex_logged_in
+            codexPath = setup.codex_path
             codexInstallCommand = setup.install_command
             codexLoginCommand = setup.login_command
         } catch {
+            setupReachable = false
             fullDiskAccessReady = false
             codexInstalled = false
             codexLoggedIn = false
+        }
+    }
+
+    func restartServiceAndRecheck() async {
+        do {
+            let _: RestartResponse = try await request(path: "api/restart", method: "POST", body: [:])
+        } catch {
+            // The service may close the connection while restarting; polling below is authoritative.
+        }
+        setupReachable = false
+        for _ in 0..<24 {
+            try? await Task.sleep(for: .milliseconds(750))
+            await checkSetup()
+            if setupReachable { return }
         }
     }
 
@@ -735,7 +762,7 @@ struct AtlasView: View {
                 let delay: Duration = phase == "paused" || tonePhase == "paused"
                     ? .seconds(3)
                     : (textIndexing
-                       || ["downloading", "indexing", "embedding"].contains(phase)
+                       || ["downloading", "verifying", "indexing", "embedding"].contains(phase)
                        || ["downloading", "preparing", "analyzing"].contains(tonePhase)
                        ? .milliseconds(700)
                        : .seconds(30))
@@ -842,7 +869,7 @@ struct AtlasView: View {
                         .padding(.bottom, 8)
                 } else if let semantic = model.semanticSearch,
                           semantic.text_index_phase != "indexing",
-                          ["downloading", "indexing", "embedding", "paused"].contains(semantic.phase) {
+                          ["downloading", "verifying", "indexing", "embedding", "paused"].contains(semantic.phase) {
                         sidebarSemanticProgress(semantic)
                             .padding(.horizontal, 14)
                             .padding(.bottom, 8)
@@ -913,25 +940,29 @@ struct AtlasView: View {
 
     private func sidebarSemanticProgress(_ status: SemanticSearchStatus) -> some View {
         let isDownloading = status.phase == "downloading"
+        let isVerifying = status.phase == "verifying"
+        let isTransfer = isDownloading || isVerifying
         let isEmbedding = status.phase == "embedding"
         let isPaused = status.phase == "paused"
         let usesEmbeddingProgress = isEmbedding || isPaused
-        let completed = isDownloading
+        let completed = isTransfer
             ? status.downloaded_bytes
             : Int64(usesEmbeddingProgress ? status.embedded_documents : status.indexed_messages)
-        let total = isDownloading
+        let total = isTransfer
             ? status.total_download_bytes
             : Int64(usesEmbeddingProgress ? status.total_documents : status.total_messages)
         let fraction = total > 0 ? min(1, Double(completed) / Double(total)) : 0
         return VStack(alignment: .leading, spacing: 7) {
             HStack(spacing: 7) {
-                Image(systemName: isDownloading ? "arrow.down.circle" : "sparkles")
+                Image(systemName: isTransfer ? "arrow.down.circle" : "sparkles")
                     .foregroundStyle(accent)
                 Text(isDownloading
                      ? "Downloading enhanced search…"
+                     : (isVerifying
+                        ? "Verifying enhanced search…"
                      : (isPaused
                         ? "Optimization paused"
-                        : (isEmbedding ? "Optimizing model…" : "Preparing enhanced search…")))
+                        : (isEmbedding ? "Optimizing model…" : "Preparing enhanced search…"))))
                     .font(.caption.weight(.semibold)).lineLimit(1)
                 Spacer(minLength: 4)
                 Text(fraction.formatted(.percent.precision(.fractionLength(0))))
@@ -943,6 +974,9 @@ struct AtlasView: View {
                     .font(.caption2).foregroundStyle(.secondary)
             } else if isEmbedding {
                 Text(status.eta_seconds.map { atlasETAText($0) } ?? "Computing ETA…")
+                    .font(.caption2).foregroundStyle(.secondary)
+            } else if isVerifying {
+                Text("Checking the downloaded file before loading it")
                     .font(.caption2).foregroundStyle(.secondary)
             } else if !isDownloading, status.total_messages > 0 {
                 Text("\(status.indexed_messages.formatted()) of \(status.total_messages.formatted()) messages")
@@ -1907,7 +1941,7 @@ private struct AtlasSettingsView: View {
             await model.loadSemanticStatus()
             while !Task.isCancelled {
                 let active = model.semanticSearch?.text_index_phase == "indexing"
-                    || ["downloading", "indexing", "embedding"].contains(model.semanticSearch?.phase ?? "")
+                    || ["downloading", "verifying", "indexing", "embedding"].contains(model.semanticSearch?.phase ?? "")
                 try? await Task.sleep(for: active ? .milliseconds(600) : .seconds(3))
                 await model.loadSemanticStatus()
             }
@@ -1931,10 +1965,17 @@ private struct AtlasSettingsView: View {
                     HStack {
                         Text("Downloading…").font(.subheadline.weight(.semibold))
                         Spacer()
-                        Text("\(byteCount(status.downloaded_bytes)) of 640 MB")
+                        Text("\(byteCount(status.downloaded_bytes)) of \(byteCount(status.total_download_bytes))")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     ProgressView(value: downloadProgress).tint(accent)
+                }
+            case "verifying":
+                HStack(spacing: 10) {
+                    ProgressView().controlSize(.small)
+                    Text("Verifying download…").font(.subheadline.weight(.semibold))
+                    Spacer()
+                    Text("Download complete").font(.caption).foregroundStyle(.secondary)
                 }
             case "indexing":
                 VStack(alignment: .leading, spacing: 8) {
@@ -2017,7 +2058,7 @@ private struct AtlasSettingsView: View {
 
     @ViewBuilder
     private var semanticActions: some View {
-        let isWorking = ["downloading", "indexing", "embedding", "paused"].contains(status?.phase ?? "")
+        let isWorking = ["downloading", "verifying", "indexing", "embedding", "paused"].contains(status?.phase ?? "")
         HStack {
             if status?.phase == "error" {
                 Button("Retry") { Task { await model.enableSemanticSearch() } }
@@ -2197,9 +2238,16 @@ private struct AtlasOnboardingView: View {
                 _ = await (semanticRefresh, toneRefresh)
                 let working = ["downloading", "preparing", "analyzing", "paused"]
                     .contains(model.sentiment?.phase ?? "")
-                    || ["downloading", "indexing", "embedding", "paused"]
+                    || ["downloading", "verifying", "indexing", "embedding", "paused"]
                     .contains(model.semanticSearch?.phase ?? "")
                 try? await Task.sleep(for: working ? .milliseconds(650) : .seconds(3))
+            }
+        }
+        .task(id: page) {
+            guard page == 4 else { return }
+            while !Task.isCancelled && page == 4 {
+                await model.checkSetup()
+                try? await Task.sleep(for: .seconds(3))
             }
         }
     }
@@ -2413,7 +2461,7 @@ private struct AtlasOnboardingView: View {
                         HStack {
                             Text("Downloading…").font(.caption.weight(.semibold))
                             Spacer()
-                            Text("\(onboardingByteCount(semantic.downloaded_bytes)) of 640 MB")
+                            Text("\(onboardingByteCount(semantic.downloaded_bytes)) of \(onboardingByteCount(semantic.total_download_bytes))")
                                 .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                         }
                         ProgressView(
@@ -2421,6 +2469,14 @@ private struct AtlasOnboardingView: View {
                                 ? min(1, Double(semantic.downloaded_bytes) / Double(semantic.total_download_bytes))
                                 : 0
                         ).tint(accent)
+                    } else if semantic.phase == "verifying" {
+                        HStack(spacing: 9) {
+                            ProgressView().controlSize(.small)
+                            Text("Verifying download…").font(.caption.weight(.semibold))
+                            Spacer()
+                            Text("Download complete")
+                                .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                        }
                     } else if semantic.phase == "error" {
                         Text(semantic.error ?? "Enhanced retrieval needs attention")
                             .font(.caption).foregroundStyle(.orange)
@@ -2459,7 +2515,9 @@ private struct AtlasOnboardingView: View {
 
             setupRow(
                 title: "Full Disk Access",
-                detail: "Required for the background Node service to open ~/Library/Messages/chat.db read-only.",
+                detail: model.serviceExecutable.isEmpty
+                    ? "Grant access to the Node executable running Atlas's background service."
+                    : "Grant Full Disk Access to \(model.serviceExecutable), then restart the service below.",
                 ready: model.fullDiskAccessReady,
                 readyText: "Messages accessible",
                 missingText: "Permission required"
@@ -2473,7 +2531,8 @@ private struct AtlasOnboardingView: View {
 
             setupRow(
                 title: "Codex CLI",
-                detail: "Atlas uses the official Codex runtime with response profiles configured for this app.",
+                detail: model.codexPath.map { "Found at \($0)" }
+                    ?? "Atlas checks your PATH and common Node, Homebrew, Volta, asdf, and mise locations.",
                 ready: model.codexInstalled,
                 readyText: "Installed",
                 missingText: "Not found"
@@ -2511,12 +2570,12 @@ private struct AtlasOnboardingView: View {
                 Text(touchIDEnabled ? "Touch ID will be requested when setup finishes." : "Atlas will open without biometric authentication.")
                     .font(.caption).foregroundStyle(.secondary)
                 Spacer()
-                Button("Recheck") { Task { await model.checkSetup() } }
+                Button("Restart & Recheck") { Task { await model.restartServiceAndRecheck() } }
                     .buttonStyle(.bordered)
             }
 
             if !canContinue {
-                Text("Complete the checks above, then select Recheck.")
+                Text("Complete the checks above, then restart the background service and recheck.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }

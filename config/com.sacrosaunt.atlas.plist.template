@@ -29,7 +29,7 @@
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>__NODE_DIR__:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <string>__SERVICE_PATH__</string>
     <key>CODEX_CLI_PATH</key>
     <string>__CODEX_CLI__</string>
     <key>ATLAS_DECODER_PATH</key>

@@ -3,6 +3,7 @@ import { existsSync, lstatSync, mkdirSync, symlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
+import { resolveCodexPath } from "./codex-discovery.js";
 import { redactSensitiveText } from "./privacy-redaction.js";
 
 const DEFAULT_CODEX_PATH = join(homedir(), ".nvm", "versions", "node", "v24.8.0", "bin", "codex");
@@ -17,6 +18,10 @@ export const ATLAS_CODEX_HOME = join(
 );
 const DEEPER_MODEL = "gpt-5.6-sol";
 const DEEPER_REASONING_EFFORT = "high";
+
+function currentCodexPath() {
+  return resolveCodexPath() ?? DEFAULT_CODEX_PATH;
+}
 
 const ATLAS_INSTRUCTIONS = `
 You are handling an Atlas conversation. A read-only MCP server named
@@ -217,7 +222,7 @@ export async function createCodexConversation({
   mcpUrl,
   cwd = DEFAULT_CWD,
   ephemeral = false,
-  codexPath = process.env.CODEX_CLI_PATH ?? DEFAULT_CODEX_PATH,
+  codexPath = currentCodexPath(),
   outputSchema,
   onActivity,
   model = DEEPER_MODEL,
@@ -253,7 +258,7 @@ export async function resumeCodexConversation({
   token,
   mcpUrl,
   cwd = DEFAULT_CWD,
-  codexPath = process.env.CODEX_CLI_PATH ?? DEFAULT_CODEX_PATH,
+  codexPath = currentCodexPath(),
   outputSchema,
   onActivity,
   model = DEEPER_MODEL,
@@ -275,7 +280,7 @@ export async function deleteCodexConversation({
   threadId,
   token,
   mcpUrl,
-  codexPath = process.env.CODEX_CLI_PATH ?? DEFAULT_CODEX_PATH,
+  codexPath = currentCodexPath(),
   codexHome = ATLAS_CODEX_HOME,
   mcpEnabled = true,
 }) {
@@ -291,7 +296,7 @@ export async function deleteCodexConversation({
 
 export async function verifyCodexConversation({
   threadId,
-  codexPath = process.env.CODEX_CLI_PATH ?? DEFAULT_CODEX_PATH,
+  codexPath = currentCodexPath(),
   codexHome = ATLAS_CODEX_HOME,
 }) {
   if (!threadId) throw new Error("A Codex thread id is required");
