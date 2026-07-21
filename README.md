@@ -1,7 +1,7 @@
 # Atlas
 
-Atlas is a native macOS app for asking questions about the iMessage history on
-your Mac. It combines a read-only local Messages connector, fast local indexes,
+Atlas is a native macOS app for asking questions about the iMessage history and
+optionally connected Calendar events on your Mac. It combines read-only local connectors, fast local indexes,
 on-device tone and semantic models, and Codex reasoning in one private desktop
 interface.
 
@@ -11,10 +11,12 @@ insights. It cannot send, edit, or delete iMessages.
 
 ## Privacy model
 
-Atlas is local-first, not fully on-device. The Messages database, attachment
+Atlas is local-first, not fully on-device. The Messages database, private Calendar snapshot, attachment
 contents, search indexes, embeddings, tone classifications, Atlas chat history,
 and Codex credentials stay on the Mac. When you ask a question, selected text
-and metadata retrieved for that question are sent to OpenAI for reasoning.
+and metadata retrieved for that question are sent to OpenAI for reasoning. When
+Calendar is connected, matching event titles, dates, locations, notes, and
+calendar names may also be sent for calendar-related questions.
 
 Before any prompt or MCP result leaves the local service, Atlas applies the same
 outbound sanitizer. Detected values are replaced with irreversible typed tokens
@@ -46,11 +48,15 @@ the current disclosure approval locally and returns an error from every Codex
 and MCP data route until that approval exists.
 
 Atlas never uploads the `chat.db` database file or attachment contents.
+Calendar access is optional and read-only. Disconnecting it in Settings deletes
+Atlas's private local event snapshot without changing events or macOS permission settings.
 
 ## Architecture
 
 ```text
 Atlas.app (SwiftUI)
+        |
+        +-- read-only EventKit access and private Calendar snapshot
         |
         | bearer-authenticated localhost API
         v
@@ -144,6 +150,9 @@ first insight generation has begun.
   direction, and timeline bucket.
 - `conversation_stats`: longitudinal sent and received activity counts.
 - `sample_conversation`: evenly spaced bounded samples for hypothesis discovery.
+- `calendar_info`: optional Calendar connection, date coverage, and opaque calendar IDs.
+- `search_calendar_events`: bounded event search across titles, dates, locations, and notes.
+- `read_calendar_events`: full cached details for selected opaque event IDs.
 
 Phone numbers and email handles are represented internally by keyed, stable,
 opaque IDs. The underlying identifiers are never returned by MCP tools.

@@ -16,6 +16,7 @@ import { SemanticIndex } from "./semantic-index.js";
 import { SentimentIndex } from "./sentiment-index.js";
 import { resolveCodexPath } from "./codex-discovery.js";
 import { waitForInitialInsightInputs } from "./insight-readiness.js";
+import { CalendarStore } from "./calendar-store.js";
 
 process.umask(0o077);
 
@@ -26,6 +27,7 @@ const tokenPath = join(stateDirectory, "mcp-token");
 const identityKeyPath = join(stateDirectory, "identity-key");
 const starterSuggestionsCachePath = join(stateDirectory, "starter-suggestions.json");
 const consentPath = join(stateDirectory, "consent.json");
+const calendarSnapshotPath = join(stateDirectory, "calendar-events.json");
 const DISCLOSURE_VERSION = 1;
 const APP_LEASE_MS = 15_000;
 
@@ -104,6 +106,10 @@ class LazyIMessageStore {
 }
 
 const store = new LazyIMessageStore();
+const calendarStore = new CalendarStore({
+  snapshotPath: calendarSnapshotPath,
+  identitySecret,
+});
 const history = new AtlasHistory();
 const semanticIndex = new SemanticIndex({ store });
 const sentimentIndex = new SentimentIndex({
@@ -117,6 +123,7 @@ const closeMcp = mountMcp(app, {
   token,
   semanticIndex,
   sentimentIndex,
+  calendarStore,
   consentProvider: loadConsent,
   activityProvider: () => analysisActive && Date.now() < appLeaseExpiresAt,
 });

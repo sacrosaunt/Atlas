@@ -10,6 +10,7 @@ private let firstInsightsNotificationKey = "atlas.firstInsightsNotification.sent
 
 private extension Notification.Name {
     static let atlasOpenInsights = Notification.Name("AtlasOpenInsights")
+    static let atlasOpenSettings = Notification.Name("AtlasOpenSettings")
 }
 
 private enum FirstInsightsNotifier {
@@ -321,6 +322,7 @@ final class AtlasModel: ObservableObject {
     @Published var suggestionsRefreshing = false
     @Published var firstInsightsReadyBanner = false
     @Published var error: String?
+    let calendar = AtlasCalendarBridge()
 
     private var authContext: LAContext?
     private var observedFirstInsightsPending = false
@@ -379,7 +381,8 @@ final class AtlasModel: ObservableObject {
         async let semantic: Void = loadSemanticStatus()
         async let tone: Void = loadSentimentStatus()
         async let starters: Void = loadSuggestions()
-        _ = await (health, history, profile, semantic, tone, starters)
+        async let calendarRefresh: Void = calendar.refresh()
+        _ = await (health, history, profile, semantic, tone, starters, calendarRefresh)
     }
 
     func checkHealth() async {
@@ -474,7 +477,7 @@ final class AtlasModel: ObservableObject {
     func select(_ newSelection: SidebarSelection?) async {
         selection = newSelection
         prompt = ""
-        chatActivity = nil
+        if !isSending { chatActivity = nil }
         error = nil
         switch newSelection {
         case .chat(let id): await loadChat(id)
@@ -487,7 +490,7 @@ final class AtlasModel: ObservableObject {
         selection = nil
         selectedChat = nil
         prompt = ""
-        chatActivity = nil
+        if !isSending { chatActivity = nil }
         error = nil
         Task { await loadSuggestions(refresh: true) }
     }
@@ -902,6 +905,13 @@ struct AtlasView: View {
                 try? await Task.sleep(for: .seconds(5))
             }
         }
+        .task(id: "calendar-\(model.lockState)-\(scenePhase)") {
+            guard model.lockState == .unlocked, scenePhase == .active else { return }
+            while !Task.isCancelled && model.lockState == .unlocked {
+                await model.calendar.refresh()
+                try? await Task.sleep(for: .seconds(15 * 60))
+            }
+        }
         .task(id: "first-insights-\(onboardingVersion)") {
             guard onboardingVersion >= currentOnboardingVersion else { return }
             while !Task.isCancelled {
@@ -915,6 +925,10 @@ struct AtlasView: View {
         .onReceive(NotificationCenter.default.publisher(for: .atlasOpenInsights)) { _ in
             model.dismissFirstInsightsBanner()
             Task { await model.select(.insights) }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .atlasOpenSettings)) { _ in
+            guard model.lockState == .unlocked else { return }
+            withAnimation(.smooth(duration: 0.24)) { showSettings = true }
         }
         .onChange(of: scenePhase) { _, phase in
             if onboardingVersion >= currentOnboardingVersion && touchIDEnabled && phase != .active { model.lock() }
@@ -1047,8 +1061,14 @@ struct AtlasView: View {
                     Label(model.status, systemImage: "lock.fill")
                         .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
                     Spacer()
-                    Button { showSettings = true } label: { Image(systemName: "gearshape") }
-                        .buttonStyle(.plain).fixedSize().help("Atlas settings")
+                    Button {
+                        withAnimation(.smooth(duration: 0.24)) { showSettings = true }
+                    } label: {
+                        Image(systemName: "gearshape")
+                            .frame(width: 28, height: 28)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain).help("Atlas settings")
                     if touchIDEnabled {
                         Button { model.lock() } label: { Image(systemName: "lock") }
                             .buttonStyle(.plain).help("Lock Atlas")
@@ -1085,15 +1105,34 @@ struct AtlasView: View {
         } message: { chat in
             Text("This removes “\(chat.title)” and its messages from Atlas. It does not change anything in Messages.")
         }
-        .sheet(isPresented: $showSettings) {
-            AtlasSettingsView(
-                model: model,
-                touchIDEnabled: $touchIDEnabled,
-                accent: accent
-            ) {
-                showSettings = false
-                model.lock()
-                onboardingVersion = 0
+        .overlay {
+            if showSettings {
+                ZStack {
+                    Color.black.opacity(colorScheme == .dark ? 0.42 : 0.18)
+                        .ignoresSafeArea()
+                        .onTapGesture {
+                            withAnimation(.smooth(duration: 0.2)) { showSettings = false }
+                        }
+                    AtlasSettingsView(
+                        model: model,
+                        calendar: model.calendar,
+                        touchIDEnabled: $touchIDEnabled,
+                        accent: accent,
+                        close: {
+                            withAnimation(.smooth(duration: 0.2)) { showSettings = false }
+                        },
+                        showOnboarding: {
+                            showSettings = false
+                            model.lock()
+                            onboardingVersion = 0
+                        }
+                    )
+                    .background(background, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+                    .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+                    .shadow(color: .black.opacity(0.28), radius: 30, y: 14)
+                    .transition(.scale(scale: 0.97).combined(with: .opacity))
+                }
+                .zIndex(20)
             }
         }
     }
@@ -1646,7 +1685,7 @@ struct AtlasView: View {
                                         removal: .opacity
                                     ))
                             }
-                            if model.isSending {
+                            if selectedChatIsSending {
                                 Group {
                                     if let draft = model.chatActivity?.draft, !draft.isEmpty {
                                         streamingResponseRow(
@@ -1691,7 +1730,7 @@ struct AtlasView: View {
                             proxy.scrollTo(id, anchor: .bottom)
                         }
                     }
-                    .onChange(of: model.isSending) { _, sending in
+                    .onChange(of: selectedChatIsSending) { _, sending in
                         if sending {
                             chatIsNearBottom = true
                             withAnimation(.smooth(duration: 0.28)) {
@@ -1700,7 +1739,7 @@ struct AtlasView: View {
                         }
                     }
                     .onChange(of: model.chatActivity?.draft?.count) { _, _ in
-                        guard model.isSending, chatIsNearBottom else { return }
+                        guard selectedChatIsSending, chatIsNearBottom else { return }
                         proxy.scrollTo("chat-bottom", anchor: .bottom)
                     }
                 }
@@ -1941,24 +1980,25 @@ struct AtlasView: View {
             HStack {
                 Spacer()
                 Button {
-                    if model.isSending {
+                    if selectedChatIsSending {
                         Task { await model.stopSending() }
                     } else {
                         Task { await model.send(responseProfile: responseProfile) }
                     }
                 } label: {
                     Label(
-                        model.isSending ? "Stop" : "Send",
-                        systemImage: model.isSending ? "stop.fill" : "arrow.up"
+                        selectedChatIsSending ? "Stop" : "Send",
+                        systemImage: selectedChatIsSending ? "stop.fill" : "arrow.up"
                     )
                     .frame(minWidth: 62)
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
-                .tint(model.isSending ? .red : accent)
-                .disabled(model.isSending
+                .tint(selectedChatIsSending ? .red : accent)
+                .disabled(selectedChatIsSending
                           ? model.sendingChatID == nil
-                          : model.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                          : model.isSending
+                            || model.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
         .padding(compactComposer ? 12 : 18)
@@ -2024,13 +2064,22 @@ struct AtlasView: View {
         if case .chat = model.selection { return true }
         return false
     }
+
+    private var selectedChatIsSending: Bool {
+        guard model.isSending, let sendingChatID = model.sendingChatID else { return false }
+        if case .chat(let selectedID) = model.selection {
+            return selectedID == sendingChatID
+        }
+        return false
+    }
 }
 
 private struct AtlasSettingsView: View {
-    @Environment(\.dismiss) private var dismiss
     @ObservedObject var model: AtlasModel
+    @ObservedObject var calendar: AtlasCalendarBridge
     @Binding var touchIDEnabled: Bool
     let accent: Color
+    let close: () -> Void
     let showOnboarding: () -> Void
     @State private var confirmRemoval = false
 
@@ -2055,7 +2104,7 @@ private struct AtlasSettingsView: View {
                         .font(.callout).foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button("Done") { dismiss() }
+                Button("Done") { close() }
                     .keyboardShortcut(.defaultAction)
             }
             .padding(24)
@@ -2079,6 +2128,8 @@ private struct AtlasSettingsView: View {
                     }
                     .padding(18)
                     .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
+
+                    calendarSettingsCard
 
                     VStack(alignment: .leading, spacing: 16) {
                         HStack(alignment: .top, spacing: 14) {
@@ -2108,6 +2159,7 @@ private struct AtlasSettingsView: View {
         }
         .frame(width: 570, height: 590)
         .task {
+            await calendar.refresh()
             await model.loadSemanticStatus()
             while !Task.isCancelled {
                 let active = model.semanticSearch?.text_index_phase == "indexing"
@@ -2124,6 +2176,90 @@ private struct AtlasSettingsView: View {
         } message: {
             Text("This deletes the downloaded component and semantic optimization data. Your Messages database is not changed.")
         }
+    }
+
+    private var calendarSettingsCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top, spacing: 14) {
+                Image(systemName: "calendar.badge.clock")
+                    .font(.title2).foregroundStyle(accent)
+                    .frame(width: 34)
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Connect Calendar").font(.headline)
+                    Text("Let Atlas use event titles, dates, locations, and notes to answer questions about your schedule. Matching event details may be sent to OpenAI when you ask about your calendar.")
+                        .font(.callout).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            HStack(spacing: 10) {
+                calendarStatusLabel
+                Spacer()
+                calendarAction
+            }
+        }
+        .padding(20)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
+    }
+
+    @ViewBuilder
+    private var calendarStatusLabel: some View {
+        switch calendar.state {
+        case .connected:
+            VStack(alignment: .leading, spacing: 2) {
+                Label("Connected · \(calendar.eventCount.formatted()) events", systemImage: "checkmark.circle.fill")
+                    .font(.subheadline.weight(.semibold)).foregroundStyle(.green)
+                if let updatedAt = calendar.updatedAt {
+                    Text("Updated \(updatedAt.formatted(.relative(presentation: .named)))")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        case .requesting:
+            Label("Waiting for permission…", systemImage: "ellipsis.circle")
+                .font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
+        case .syncing:
+            HStack(spacing: 9) {
+                ProgressView().controlSize(.small)
+                Text("Reading events…").font(.subheadline.weight(.semibold))
+            }
+        case .denied:
+            Label("Calendar access denied", systemImage: "exclamationmark.triangle.fill")
+                .font(.subheadline.weight(.semibold)).foregroundStyle(.orange)
+        case .restricted:
+            Label("Calendar access restricted", systemImage: "lock.fill")
+                .font(.subheadline.weight(.semibold)).foregroundStyle(.orange)
+        case .error(let detail):
+            VStack(alignment: .leading, spacing: 2) {
+                Label("Calendar needs attention", systemImage: "exclamationmark.triangle.fill")
+                    .font(.subheadline.weight(.semibold)).foregroundStyle(.orange)
+                Text(detail).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+            }
+        case .disconnected:
+            Label("Not connected", systemImage: "calendar")
+                .font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder
+    private var calendarAction: some View {
+        switch calendar.state {
+        case .connected:
+            Button("Disconnect", role: .destructive) { calendar.disconnect() }
+                .buttonStyle(.borderless)
+        case .denied, .restricted:
+            Button("Open Settings") { openCalendarPrivacySettings() }
+                .buttonStyle(.bordered)
+        case .requesting, .syncing:
+            EmptyView()
+        case .disconnected, .error:
+            Button("Connect") { Task { await calendar.connect() } }
+                .buttonStyle(.borderedProminent).tint(accent)
+        }
+    }
+
+    private func openCalendarPrivacySettings() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Calendars") else { return }
+        NSWorkspace.shared.open(url)
     }
 
     @ViewBuilder
@@ -3034,5 +3170,13 @@ struct AtlasApp: App {
         WindowGroup { AtlasView() }
             .windowStyle(.hiddenTitleBar)
             .defaultSize(width: 1080, height: 760)
+            .commands {
+                CommandGroup(replacing: .appSettings) {
+                    Button("Settings…") {
+                        NotificationCenter.default.post(name: .atlasOpenSettings, object: nil)
+                    }
+                    .keyboardShortcut(",", modifiers: .command)
+                }
+            }
     }
 }
