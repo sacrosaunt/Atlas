@@ -1,4 +1,5 @@
 import CoreML
+import CONNXRuntime
 import CryptoKit
 import Foundation
 
@@ -45,6 +46,7 @@ actor ToneIndex {
     private var task: Task<Void, Never>?
     private var downloadTask: Task<Void, Never>?
     private var classifier: NativeToneClassifier?
+    private var inferenceBackend: String?
     private var sleepAssertion: Process?
 
     init(databaseURL: URL, directory: URL) {
@@ -56,6 +58,7 @@ actor ToneIndex {
         settingsURL = directory.appending(path: "settings.json")
         enabled = Self.readEnabled(directory.appending(path: "settings.json"))
         phase = enabled ? "starting" : "off"
+        inferenceBackend = FileManager.default.fileExists(atPath: directory.appending(path: "coreml/ToneClassifier.mlpackage").path) ? "coreml" : nil
         try? FileManager.default.createDirectory(at: modelDirectory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
     }
 
@@ -84,7 +87,7 @@ actor ToneIndex {
             "analyzed_turns": .number(Double(analyzedTurns)), "total_turns": .number(Double(totalTurns)),
             "analyzed_windows": .number(Double(analyzedWindows)), "total_windows": .number(Double(totalWindows)),
             "eta_seconds": currentETA.map(JSONValue.number) ?? .null,
-            "inference_backend": classifier == nil ? .null : .string("coreml"),
+            "inference_backend": inferenceBackend.map(JSONValue.string) ?? .null,
             "model_revision": .string(toneRevision), "error": error.map(JSONValue.string) ?? .null,
         ])
     }
@@ -173,9 +176,6 @@ actor ToneIndex {
     private func scheduleIfPossible() {
         guard enabled else { phase = "off"; return }
         guard modelFilesInstalled else { phase = downloadTask == nil ? "not_downloaded" : "downloading"; return }
-        guard FileManager.default.fileExists(atPath: coreMLPackage.path) else {
-            phase = "error"; error = "The native tone component is missing. Reinstall Atlas to restore it."; return
-        }
         guard foregroundActive else { phase = "waiting_for_app"; return }
         guard textIndexReady else { phase = "waiting_for_index"; return }
         guard task == nil else { return }
@@ -192,8 +192,13 @@ actor ToneIndex {
             let database = try openDatabase(); try materialize(database)
             phase = "analyzing"; startedAt = Date(); rate = 0; publishedETA = nil; etaPublishedAt = nil
             startSleepAssertion()
-            let classifier = try NativeToneClassifier(modelPackage: coreMLPackage, modelDirectory: modelDirectory)
+            let classifier = try NativeToneClassifier(
+                modelPackage: coreMLPackage,
+                onnxModel: modelDirectory.appending(path: "onnx/model_quantized.onnx"),
+                modelDirectory: modelDirectory
+            )
             self.classifier = classifier
+            inferenceBackend = classifier.backendName
             while foregroundActive && enabled {
                 try Task.checkCancellation()
                 if ProcessInfo.processInfo.isLowPowerModeEnabled { phase = "paused"; stopSleepAssertion(); try await Task.sleep(for: .seconds(15)); continue }
@@ -287,7 +292,7 @@ actor ToneIndex {
 
     private var installedBytes: Int64 { toneFiles.reduce(0) { $0 + min($1.bytes, fileSize(modelDirectory.appending(path: $1.path))) } }
     private var modelFilesInstalled: Bool { FileManager.default.fileExists(atPath: markerURL.path) && toneFiles.allSatisfy { fileSize(modelDirectory.appending(path: $0.path)) == $0.bytes } }
-    private var isInstalled: Bool { modelFilesInstalled && FileManager.default.fileExists(atPath: coreMLPackage.path) }
+    private var isInstalled: Bool { modelFilesInstalled }
 
     private func startDownload() {
         guard downloadTask == nil else { return }
@@ -375,30 +380,180 @@ private struct ToneScore { let negative: Double, neutral: Double, positive: Doub
 
 private final class NativeToneClassifier {
     private let tokenizer: RobertaTokenizer
-    private let compiled: URL
-    private var models: [Int: MLModel] = [:]
-    init(modelPackage: URL, modelDirectory: URL) throws {
+    private let backend: ToneInferenceBackend
+    let backendName: String
+
+    init(modelPackage: URL, onnxModel: URL, modelDirectory: URL) throws {
         tokenizer = try RobertaTokenizer(vocab: modelDirectory.appending(path: "vocab.json"), merges: modelDirectory.appending(path: "merges.txt"))
-        compiled = try MLModel.compileModel(at: modelPackage)
+        let preference = ProcessInfo.processInfo.environment["ATLAS_TONE_BACKEND"]
+        if preference != "onnx", FileManager.default.fileExists(atPath: modelPackage.path) {
+            backend = .coreML(try CoreMLToneInference(modelPackage: modelPackage))
+            backendName = "coreml"
+        } else {
+            backend = .onnx(try ONNXToneInference(model: onnxModel))
+            backendName = "onnx"
+        }
     }
+
     func classify(_ texts: [String]) throws -> [ToneScore] {
         let tokenized = texts.map { tokenizer.encode($0, maximum: 512) }
         let length = [32,64,128,256,512].first { $0 >= (tokenized.map(\.count).max() ?? 1) } ?? 512
+        var ids = [Int64](repeating: 1, count: texts.count * length)
+        var mask = [Int64](repeating: 0, count: texts.count * length)
+        for (row, tokens) in tokenized.enumerated() {
+            for (column, token) in tokens.prefix(length).enumerated() {
+                ids[row * length + column] = Int64(token)
+                mask[row * length + column] = 1
+            }
+        }
+        return try backend.classify(ids: &ids, mask: &mask, batch: texts.count, length: length)
+    }
+}
+
+func verifyToneRuntime(at directory: URL) throws -> JSONValue {
+    let modelDirectory = directory.appending(path: "model", directoryHint: .isDirectory)
+    let classifier = try NativeToneClassifier(
+        modelPackage: directory.appending(path: "coreml/ToneClassifier.mlpackage"),
+        onnxModel: modelDirectory.appending(path: "onnx/model_quantized.onnx"),
+        modelDirectory: modelDirectory
+    )
+    let samples = ["That worked beautifully.", "I am waiting for an update.", "This is deeply frustrating."]
+    let scores = try classifier.classify(samples)
+    return .object([
+        "backend": .string(classifier.backendName),
+        "scores": .array(scores.map { .object([
+            "negative": .number($0.negative), "neutral": .number($0.neutral), "positive": .number($0.positive),
+        ]) }),
+    ])
+}
+
+private enum ToneInferenceBackend {
+    case coreML(CoreMLToneInference)
+    case onnx(ONNXToneInference)
+
+    func classify(ids: inout [Int64], mask: inout [Int64], batch: Int, length: Int) throws -> [ToneScore] {
+        switch self {
+        case .coreML(let model): return try model.classify(ids: ids, mask: mask, batch: batch, length: length)
+        case .onnx(let model): return try model.classify(ids: &ids, mask: &mask, batch: batch, length: length)
+        }
+    }
+}
+
+private final class CoreMLToneInference {
+    private let compiled: URL
+    private var models: [Int: MLModel] = [:]
+
+    init(modelPackage: URL) throws {
+        compiled = try MLModel.compileModel(at: modelPackage)
+    }
+
+    func classify(ids sourceIDs: [Int64], mask sourceMask: [Int64], batch: Int, length: Int) throws -> [ToneScore] {
         let shape = [NSNumber(value: 8), NSNumber(value: length)]
         let ids = try MLMultiArray(shape: shape, dataType: .int32), mask = try MLMultiArray(shape: shape, dataType: .int32)
         for index in 0..<(8 * length) { ids[index] = 1; mask[index] = 0 }
-        for (row, tokens) in tokenized.enumerated() { for (column, token) in tokens.prefix(length).enumerated() { ids[row*length+column] = NSNumber(value: token); mask[row*length+column] = 1 } }
+        for index in sourceIDs.indices { ids[index] = NSNumber(value: sourceIDs[index]); mask[index] = NSNumber(value: sourceMask[index]) }
         let configuration = MLModelConfiguration(); configuration.computeUnits = .all; configuration.functionName = "tone_b8_s\(length)"
         let model: MLModel
         if let existing = models[length] { model = existing } else { model = try MLModel(contentsOf: compiled, configuration: configuration); models[length] = model }
         let input = try MLDictionaryFeatureProvider(dictionary: ["input_ids": MLFeatureValue(multiArray: ids), "attention_mask": MLFeatureValue(multiArray: mask)])
         guard let logits = try model.prediction(from: input).featureValue(for: "logits")?.multiArrayValue else { throw ToneError.invalidOutput }
-        return texts.indices.map { row in
+        return (0..<batch).map { row in
             let values = (0..<3).map { logits[row*3+$0].doubleValue }, maximum = values.max() ?? 0
-            let exponents = values.map { Foundation.exp($0-maximum) }, total = exponents.reduce(0,+)
-            return ToneScore(negative: exponents[0]/total, neutral: exponents[1]/total, positive: exponents[2]/total)
+            return toneScore(values, maximum: maximum)
         }
     }
+}
+
+private final class ONNXToneInference {
+    private let api: UnsafePointer<OrtApi>
+    private var environment: OpaquePointer?
+    private var sessionOptions: OpaquePointer?
+    private var session: OpaquePointer?
+    private var memoryInfo: OpaquePointer?
+
+    init(model: URL) throws {
+        guard FileManager.default.fileExists(atPath: model.path),
+              let base = OrtGetApiBase(),
+              let loadedAPI = base.pointee.GetApi(UInt32(ORT_API_VERSION)) else {
+            throw ToneError.missingRuntime
+        }
+        api = loadedAPI
+        try check(api.pointee.CreateEnv(ORT_LOGGING_LEVEL_WARNING, "AtlasTone", &environment))
+        try check(api.pointee.CreateSessionOptions(&sessionOptions))
+        try check(api.pointee.SetIntraOpNumThreads(sessionOptions, 2))
+        try check(api.pointee.SetSessionGraphOptimizationLevel(sessionOptions, ORT_ENABLE_ALL))
+        try model.path.withCString { path in
+            try check(api.pointee.CreateSession(environment, path, sessionOptions, &session))
+        }
+        try check(api.pointee.CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &memoryInfo))
+    }
+
+    deinit {
+        if let memoryInfo { api.pointee.ReleaseMemoryInfo(memoryInfo) }
+        if let session { api.pointee.ReleaseSession(session) }
+        if let sessionOptions { api.pointee.ReleaseSessionOptions(sessionOptions) }
+        if let environment { api.pointee.ReleaseEnv(environment) }
+    }
+
+    func classify(ids: inout [Int64], mask: inout [Int64], batch: Int, length: Int) throws -> [ToneScore] {
+        let shape = [Int64(batch), Int64(length)]
+        var idTensor: OpaquePointer?
+        var maskTensor: OpaquePointer?
+        defer {
+            if let idTensor { api.pointee.ReleaseValue(idTensor) }
+            if let maskTensor { api.pointee.ReleaseValue(maskTensor) }
+        }
+
+        try shape.withUnsafeBufferPointer { shapeBuffer in
+            try ids.withUnsafeMutableBytes { buffer in
+                try check(api.pointee.CreateTensorWithDataAsOrtValue(
+                    memoryInfo, buffer.baseAddress, buffer.count, shapeBuffer.baseAddress, shape.count,
+                    ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, &idTensor
+                ))
+            }
+            try mask.withUnsafeMutableBytes { buffer in
+                try check(api.pointee.CreateTensorWithDataAsOrtValue(
+                    memoryInfo, buffer.baseAddress, buffer.count, shapeBuffer.baseAddress, shape.count,
+                    ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, &maskTensor
+                ))
+            }
+        }
+
+        let firstName = strdup("input_ids"), secondName = strdup("attention_mask"), outputName = strdup("logits")
+        defer { free(firstName); free(secondName); free(outputName) }
+        let inputNames: [UnsafePointer<CChar>?] = [UnsafePointer(firstName), UnsafePointer(secondName)]
+        let inputValues: [OpaquePointer?] = [idTensor, maskTensor]
+        let outputNames: [UnsafePointer<CChar>?] = [UnsafePointer(outputName)]
+        var output: OpaquePointer?
+        try inputNames.withUnsafeBufferPointer { names in
+            try inputValues.withUnsafeBufferPointer { values in
+                try outputNames.withUnsafeBufferPointer { outputs in
+                    try check(api.pointee.Run(session, nil, names.baseAddress, values.baseAddress, values.count, outputs.baseAddress, outputs.count, &output))
+                }
+            }
+        }
+        guard let output else { throw ToneError.invalidOutput }
+        defer { api.pointee.ReleaseValue(output) }
+        var raw: UnsafeMutableRawPointer?
+        try check(api.pointee.GetTensorMutableData(output, &raw))
+        guard let floats = raw?.assumingMemoryBound(to: Float.self) else { throw ToneError.invalidOutput }
+        return (0..<batch).map { row in
+            let values = (0..<3).map { Double(floats[row * 3 + $0]) }
+            return toneScore(values, maximum: values.max() ?? 0)
+        }
+    }
+
+    private func check(_ status: OpaquePointer?) throws {
+        guard let status else { return }
+        let message = api.pointee.GetErrorMessage(status).map(String.init(cString:)) ?? "ONNX Runtime error"
+        api.pointee.ReleaseStatus(status)
+        throw ToneError.runtime(message)
+    }
+}
+
+private func toneScore(_ values: [Double], maximum: Double) -> ToneScore {
+    let exponents = values.map { Foundation.exp($0 - maximum) }, total = exponents.reduce(0, +)
+    return ToneScore(negative: exponents[0] / total, neutral: exponents[1] / total, positive: exponents[2] / total)
 }
 
 private final class RobertaTokenizer {
@@ -452,8 +607,15 @@ private func fileSize(_ url: URL) -> Int64 { (try? FileManager.default.attribute
 private func hash(_ url: URL) throws -> String { let data = try Data(contentsOf: url, options: .mappedIfSafe); return SHA256.hash(data: data).map { String(format:"%02x",$0) }.joined() }
 
 private enum ToneError: Error, LocalizedError {
-    case invalidDownload, invalidOutput
-    var errorDescription: String? { switch self { case .invalidDownload: "The downloaded tone component could not be verified"; case .invalidOutput: "The local tone model returned an invalid result" } }
+    case invalidDownload, invalidOutput, missingRuntime, runtime(String)
+    var errorDescription: String? {
+        switch self {
+        case .invalidDownload: "The downloaded tone component could not be verified"
+        case .invalidOutput: "The local tone model returned an invalid result"
+        case .missingRuntime: "The local tone runtime is unavailable"
+        case .runtime(let message): "Local tone analysis failed: \(message)"
+        }
+    }
 }
 
 private final class ToneDownloadDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {

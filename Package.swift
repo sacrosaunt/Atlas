@@ -10,12 +10,17 @@ let package = Package(
             url: "https://github.com/hummingbird-project/hummingbird.git",
             exact: "2.25.1"
         ),
+        .package(
+            url: "https://github.com/readdle/swift-onnxruntime.git",
+            exact: "1.20.1"
+        ),
     ],
     targets: [
         .executableTarget(
             name: "AtlasBackend",
             dependencies: [
                 .product(name: "Hummingbird", package: "hummingbird"),
+                .product(name: "CONNXRuntime", package: "swift-onnxruntime"),
                 "LlamaFramework",
             ],
             path: "swift-backend",

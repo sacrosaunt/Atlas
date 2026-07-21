@@ -9,6 +9,14 @@ private let atlasLeaseSeconds: TimeInterval = 15
 @main
 struct AtlasBackendMain {
     static func main() async throws {
+        if CommandLine.arguments.contains("--verify-tone-runtime") {
+            let paths = AtlasPaths()
+            let result = try verifyToneRuntime(at: paths.toneDirectory)
+            let data = try JSONEncoder().encode(result)
+            FileHandle.standardOutput.write(data)
+            FileHandle.standardOutput.write(Data("\n".utf8))
+            return
+        }
         let parentPID = Darwin.getppid()
         if parentPID > 1 {
             Task.detached {

@@ -40,7 +40,7 @@ Atlas.app (SwiftUI UI process)
 atlas-backend (separate Swift child process inside the signed app bundle)
     +-- read-only Messages, Contacts, and Calendar snapshot access
     +-- SQLite FTS sidecar and native llama.cpp embeddings
-    +-- native Core ML tone classifier
+    +-- local Core ML/ONNX tone classifier
     +-- Codex app-server with only Atlas MCP enabled
             +-- locally redacted, selected evidence sent to OpenAI
 ```
@@ -64,7 +64,8 @@ chat deletes its Codex thread too.
 - Optional enhanced search downloads about 640 MB and embeds passages locally
   with Metal, newest first. It reports partial coverage explicitly.
 - Tone analysis combines adjacent bubbles into speaker turns and short
-  multi-speaker windows, then runs a three-way Core ML classifier locally.
+  multi-speaker windows, then runs a three-way classifier locally. Core ML is
+  preferred when bundled; verified ONNX inference is the native fallback.
 - First insights wait for FTS and tone analysis to settle; embeddings do not
   block them.
 - Embeddings pause on battery. Tone runs on battery except in Low Power Mode.
@@ -102,11 +103,13 @@ cd Atlas
 ./scripts/install.sh
 ```
 
-The installer builds the Swift backend and UI, copies the llama framework, and
-ad-hoc signs `~/Applications/Atlas.app`. The app starts and supervises the
-separate backend only while Atlas is open. Production distributions include the
-precompiled Core ML tone package at `assets/ToneClassifier.mlpackage`; source
-builders can create that asset with `scripts/convert-tone-coreml.py`.
+The installer builds the Swift backend and UI, copies the native llama and ONNX
+runtimes, and ad-hoc signs `~/Applications/Atlas.app`. The app starts and
+supervises the separate backend only while Atlas is open. Atlas prefers the
+optional precompiled Core ML tone package at `assets/ToneClassifier.mlpackage`
+and otherwise runs the verified downloaded tone model through ONNX Runtime.
+Source builders can create the faster Core ML asset with
+`scripts/convert-tone-coreml.py`.
 
 Older installs can remove the retired Login Agent while preserving the app and local data:
 
