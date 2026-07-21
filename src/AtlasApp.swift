@@ -3726,7 +3726,7 @@ private struct AtlasOnboardingView: View {
             setupRow(
                 title: "Full Disk Access",
                 detail: model.serviceExecutable.isEmpty
-                    ? "Grant access to the Node executable running Atlas's background service."
+                    ? "Grant access to Atlas's standalone background service."
                     : "Grant Full Disk Access to \(model.serviceExecutable), then restart the service below.",
                 ready: model.fullDiskAccessReady,
                 readyText: "Messages accessible",
@@ -3742,7 +3742,7 @@ private struct AtlasOnboardingView: View {
             setupRow(
                 title: "Codex CLI",
                 detail: model.codexPath.map { "Found at \($0)" }
-                    ?? "Atlas checks your PATH and common Node, Homebrew, Volta, asdf, and mise locations.",
+                    ?? "Atlas checks your PATH and common package-manager locations.",
                 ready: model.codexInstalled,
                 readyText: "Installed",
                 missingText: "Not found"
@@ -4306,8 +4306,12 @@ private extension String {
 }
 
 private final class AtlasAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
+    private var backendProcess: Process?
+    private var terminating = false
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         UNUserNotificationCenter.current().delegate = self
+        launchBackend()
     }
 
     func userNotificationCenter(
@@ -4325,6 +4329,8 @@ private final class AtlasAppDelegate: NSObject, NSApplicationDelegate, UNUserNot
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        terminating = true
+        defer { if let backendProcess, backendProcess.isRunning { backendProcess.terminate() } }
         guard let token = try? String(contentsOfFile: tokenPath, encoding: .utf8)
             .trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty else { return }
         var request = URLRequest(url: serviceURL.appending(path: "api/app/heartbeat"))
@@ -4334,6 +4340,26 @@ private final class AtlasAppDelegate: NSObject, NSApplicationDelegate, UNUserNot
         let completed = DispatchSemaphore(value: 0)
         URLSession.shared.dataTask(with: request) { _, _, _ in completed.signal() }.resume()
         _ = completed.wait(timeout: .now() + .milliseconds(750))
+    }
+
+    private func launchBackend() {
+        guard !terminating, backendProcess?.isRunning != true,
+              let executable = Bundle.main.executableURL?.deletingLastPathComponent().appending(path: "atlas-backend"),
+              FileManager.default.isExecutableFile(atPath: executable.path) else { return }
+        let process = Process()
+        process.executableURL = executable
+        process.currentDirectoryURL = Bundle.main.bundleURL
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        process.terminationHandler = { [weak self] finished in
+            DispatchQueue.main.asyncAfter(deadline: .now() + (finished.terminationStatus == 75 ? 0.15 : 0.75)) {
+                guard let self, self.backendProcess === finished else { return }
+                self.backendProcess = nil
+                self.launchBackend()
+            }
+        }
+        do { try process.run(); backendProcess = process }
+        catch { backendProcess = nil }
     }
 }
 
