@@ -117,6 +117,20 @@ thermal pressure. On external power, Atlas prevents idle system sleep while
 long-running optimization is active; the display may still sleep.
 Closing Atlas releases the sleep assertion and pauses optimization.
 
+### First insights
+
+Atlas waits for the full-text index and local tone analysis to settle before it
+creates the first insight document. A tone-model failure is treated as an
+explicitly unavailable signal rather than blocking Atlas indefinitely.
+Embeddings do not block first insights and can continue improving semantic
+coverage afterward.
+
+When the first insight document is ready, Atlas shows a one-time in-app banner
+or, when it is behind another app, a privacy-safe macOS notification. The
+notification contains no names, excerpts, or findings and opens **Insights
+About You** when selected. Notification permission is requested only after the
+first insight generation has begun.
+
 ## MCP tools
 
 - `database_info`: archive record counts without message text.

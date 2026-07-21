@@ -15,6 +15,7 @@ import { mountMcp } from "./mcp.js";
 import { SemanticIndex } from "./semantic-index.js";
 import { SentimentIndex } from "./sentiment-index.js";
 import { resolveCodexPath } from "./codex-discovery.js";
+import { waitForInitialInsightInputs } from "./insight-readiness.js";
 
 process.umask(0o077);
 
@@ -653,6 +654,13 @@ Follow the supplied JSON schema.
 `.trim();
 
     try {
+      if (!current.content) {
+        await waitForInitialInsightInputs({
+          semanticIndex,
+          sentimentIndex,
+          signal: controller.signal,
+        });
+      }
       let result;
       if (current.codex_thread_id) {
         try {
@@ -998,6 +1006,18 @@ app.get("/api/insights", (req, res) => {
     content: undefined,
     document,
     current_message_count: messageCount,
+  });
+});
+
+app.get("/api/insights/status", (req, res) => {
+  if (!requireApp(req, res)) return;
+  if (!requireConsent(req, res)) return;
+  if (!requireActiveApp(req, res)) return;
+  const snapshot = history.getInsights();
+  res.json({
+    status: snapshot.status,
+    has_document: Boolean(snapshot.content),
+    updated_at: snapshot.updated_at,
   });
 });
 

@@ -1,10 +1,40 @@
 import SwiftUI
 import LocalAuthentication
 import AppKit
+import UserNotifications
 
 private let serviceURL = URL(string: "http://127.0.0.1:47831")!
 private let tokenPath = NSString(string: "~/Library/Application Support/Atlas/mcp-token").expandingTildeInPath
 private let currentOnboardingVersion = 3
+private let firstInsightsNotificationKey = "atlas.firstInsightsNotification.sent"
+
+private extension Notification.Name {
+    static let atlasOpenInsights = Notification.Name("AtlasOpenInsights")
+}
+
+private enum FirstInsightsNotifier {
+    static func requestPermission() async {
+        _ = try? await UNUserNotificationCenter.current()
+            .requestAuthorization(options: [.alert, .sound])
+    }
+
+    static func notify() async {
+        let center = UNUserNotificationCenter.current()
+        let settings = await center.notificationSettings()
+        guard settings.authorizationStatus == .authorized
+                || settings.authorizationStatus == .provisional else { return }
+        let content = UNMutableNotificationContent()
+        content.title = "Atlas"
+        content.body = "Your first Atlas insights are ready."
+        content.sound = .default
+        let request = UNNotificationRequest(
+            identifier: "atlas.first-insights-ready",
+            content: content,
+            trigger: nil
+        )
+        try? await center.add(request)
+    }
+}
 
 private struct HealthResponse: Decodable {
     let ok: Bool
@@ -36,6 +66,11 @@ private struct ConsentResponse: Decodable {
     let disclosure_version: Int
 }
 private struct AppHeartbeatResponse: Decodable { let active: Bool }
+private struct InsightStatusResponse: Decodable {
+    let status: String
+    let has_document: Bool
+    let updated_at: String?
+}
 
 struct SemanticSearchStatus: Decodable, Equatable {
     let enabled: Bool
@@ -197,6 +232,8 @@ private struct ChatScrollIntentMonitor: NSViewRepresentable {
     final class Coordinator {
         var onUserScroll: () -> Void
         private var observer: NSObjectProtocol?
+        private var retryWorkItem: DispatchWorkItem?
+        private var retryCount = 0
 
         init(onUserScroll: @escaping () -> Void) {
             self.onUserScroll = onUserScroll
@@ -205,12 +242,20 @@ private struct ChatScrollIntentMonitor: NSViewRepresentable {
         func attach(to view: NSView) {
             guard observer == nil else { return }
             guard let scrollView = view.enclosingScrollView else {
-                DispatchQueue.main.async { [weak self, weak view] in
+                guard retryWorkItem == nil, retryCount < 20 else { return }
+                retryCount += 1
+                let workItem = DispatchWorkItem { [weak self, weak view] in
                     guard let self, let view else { return }
+                    self.retryWorkItem = nil
                     self.attach(to: view)
                 }
+                retryWorkItem = workItem
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: workItem)
                 return
             }
+            retryWorkItem?.cancel()
+            retryWorkItem = nil
+            retryCount = 0
             observer = NotificationCenter.default.addObserver(
                 forName: NSScrollView.willStartLiveScrollNotification,
                 object: scrollView,
@@ -221,6 +266,7 @@ private struct ChatScrollIntentMonitor: NSViewRepresentable {
         }
 
         deinit {
+            retryWorkItem?.cancel()
             if let observer { NotificationCenter.default.removeObserver(observer) }
         }
     }
@@ -273,9 +319,11 @@ final class AtlasModel: ObservableObject {
     @Published var sentiment: SentimentStatus?
     @Published var suggestions: [String] = []
     @Published var suggestionsRefreshing = false
+    @Published var firstInsightsReadyBanner = false
     @Published var error: String?
 
     private var authContext: LAContext?
+    private var observedFirstInsightsPending = false
 
     func unlock() async {
         guard lockState != .unlocking else { return }
@@ -508,9 +556,49 @@ final class AtlasModel: ObservableObject {
     func loadInsights() async {
         guard lockState == .unlocked else { return }
         do {
-            insights = try await request(path: "api/insights")
+            let snapshot: InsightSnapshot = try await request(path: "api/insights")
+            insights = snapshot
+            observeFirstInsight(status: snapshot.status, hasDocument: snapshot.document != nil)
         } catch {
             self.error = error.localizedDescription
+        }
+    }
+
+    func checkFirstInsightsReady() async {
+        guard observedFirstInsightsPending else { return }
+        do {
+            let status: InsightStatusResponse = try await request(path: "api/insights/status")
+            observeFirstInsight(status: status.status, hasDocument: status.has_document)
+        } catch {
+            // The foreground lease or service may be transitioning; the next poll will retry.
+        }
+    }
+
+    func dismissFirstInsightsBanner() {
+        firstInsightsReadyBanner = false
+    }
+
+    private func observeFirstInsight(status: String, hasDocument: Bool) {
+        let defaults = UserDefaults.standard
+        guard !defaults.bool(forKey: firstInsightsNotificationKey) else { return }
+        if !hasDocument && status == "refreshing" {
+            if !observedFirstInsightsPending {
+                observedFirstInsightsPending = true
+                Task { await FirstInsightsNotifier.requestPermission() }
+            }
+            return
+        }
+        guard hasDocument && observedFirstInsightsPending else { return }
+        observedFirstInsightsPending = false
+        defaults.set(true, forKey: firstInsightsNotificationKey)
+        if NSApp.isActive {
+            firstInsightsReadyBanner = true
+            Task {
+                try? await Task.sleep(for: .seconds(8))
+                firstInsightsReadyBanner = false
+            }
+        } else {
+            Task { await FirstInsightsNotifier.notify() }
         }
     }
 
@@ -749,7 +837,7 @@ struct AtlasView: View {
     }
 
     var body: some View {
-        ZStack {
+        ZStack(alignment: .top) {
             background.ignoresSafeArea()
             ambientBackground
             if onboardingVersion < currentOnboardingVersion {
@@ -761,6 +849,12 @@ struct AtlasView: View {
                 mainView
             } else {
                 lockedView
+            }
+            if model.firstInsightsReadyBanner {
+                firstInsightsBanner
+                    .padding(.top, 18)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .zIndex(10)
             }
         }
         .frame(minWidth: 880, minHeight: 640)
@@ -808,8 +902,19 @@ struct AtlasView: View {
                 try? await Task.sleep(for: .seconds(5))
             }
         }
+        .task(id: "first-insights-\(onboardingVersion)") {
+            guard onboardingVersion >= currentOnboardingVersion else { return }
+            while !Task.isCancelled {
+                await model.checkFirstInsightsReady()
+                try? await Task.sleep(for: .seconds(2))
+            }
+        }
         .onDisappear {
             Task { await model.releaseAppLease() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .atlasOpenInsights)) { _ in
+            model.dismissFirstInsightsBanner()
+            Task { await model.select(.insights) }
         }
         .onChange(of: scenePhase) { _, phase in
             if onboardingVersion >= currentOnboardingVersion && touchIDEnabled && phase != .active { model.lock() }
@@ -830,6 +935,28 @@ struct AtlasView: View {
                 .offset(x: geometry.size.width - 210, y: -220)
         }
         .allowsHitTesting(false)
+    }
+
+    private var firstInsightsBanner: some View {
+        Button {
+            model.dismissFirstInsightsBanner()
+            Task { await model.select(.insights) }
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: "sparkles")
+                    .font(.title3).foregroundStyle(accent)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Your first insights are ready").font(.headline)
+                    Text("Open Insights About You").font(.caption).foregroundStyle(.secondary)
+                }
+                Image(systemName: "chevron.right")
+                    .font(.caption.bold()).foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 18).padding(.vertical, 12)
+            .background(.regularMaterial, in: Capsule())
+            .shadow(color: .black.opacity(0.14), radius: 16, y: 6)
+        }
+        .buttonStyle(.plain)
     }
 
     private var lockedView: some View {
@@ -1547,10 +1674,10 @@ struct AtlasView: View {
                         }
                         .padding(28)
                         .animation(.smooth(duration: 0.3), value: model.selectedChat?.messages.count)
+                        .background(ChatScrollIntentMonitor {
+                            chatIsNearBottom = false
+                        })
                     }
-                    .background(ChatScrollIntentMonitor {
-                        chatIsNearBottom = false
-                    })
                     .coordinateSpace(name: "chat-scroll")
                     .onPreferenceChange(ChatBottomPreferenceKey.self) { bottomY in
                         chatIsNearBottom = bottomY <= viewport.size.height + 72
@@ -2867,7 +2994,25 @@ private extension String {
     }
 }
 
-private final class AtlasAppDelegate: NSObject, NSApplicationDelegate {
+private final class AtlasAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        UNUserNotificationCenter.current().delegate = self
+    }
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        if response.notification.request.identifier == "atlas.first-insights-ready" {
+            DispatchQueue.main.async {
+                NSApp.activate(ignoringOtherApps: true)
+                NotificationCenter.default.post(name: .atlasOpenInsights, object: nil)
+            }
+        }
+        completionHandler()
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         guard let token = try? String(contentsOfFile: tokenPath, encoding: .utf8)
             .trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty else { return }
