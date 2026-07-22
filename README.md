@@ -4,8 +4,7 @@ Atlas is a native macOS app for exploring iMessage history and optionally
 connected Calendar events. Its SwiftUI interface and standalone Swift backend
 are separate processes connected through a bearer-authenticated localhost API.
 The backend owns read-only data access, local indexes, on-device models, MCP,
-Codex conversations, and persisted chat history. Node.js is not used or
-packaged.
+Codex conversations, and persisted chat history.
 
 Atlas can investigate relationships, recover details from old exchanges,
 compare communication patterns over time, and build evidence-based personal
