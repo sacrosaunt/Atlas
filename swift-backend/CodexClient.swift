@@ -24,8 +24,9 @@ struct CodexTurnOptions: Sendable {
     var developerInstructions = atlasDeveloperInstructions
     var mcpEnabled = true
     var codexHome: URL?
-    var onActivity: (@Sendable (CodexActivity) -> Void)?
+    var onActivity: (@Sendable (CodexActivity) async -> Void)?
     var onThreadStarted: (@Sendable (String) -> Void)?
+    var onTurnStarted: (@Sendable () async -> Void)?
 }
 
 final class CodexClient: @unchecked Sendable {
@@ -90,6 +91,7 @@ final class CodexClient: @unchecked Sendable {
             let turnResult = try await connection.request("turn/start", params: .object(start), timeout: 120)
             guard let turnID = turnResult["turn"]?["id"]?.stringValue else { throw CodexError.protocolError("Codex did not return a turn ID") }
             turnState.setTurn(turnID)
+            await options.onTurnStarted?()
             let collected = try await notificationTask.value
             guard collected.status == "completed" else {
                 if Task.isCancelled || collected.status == "interrupted" { throw CancellationError() }
@@ -139,7 +141,7 @@ private struct CollectedTurn: Sendable {
 private func collectTurn(
     _ stream: AsyncStream<JSONValue>,
     threadID: String,
-    onActivity: (@Sendable (CodexActivity) -> Void)?
+    onActivity: (@Sendable (CodexActivity) async -> Void)?
 ) async throws -> CollectedTurn {
     var messages: [(phase: String?, text: String)] = []
     var phases: [String: String] = [:]
@@ -149,18 +151,18 @@ private func collectTurn(
         let item = message["params"]?["item"]
         if method == "item/started", item?["type"]?.stringValue == "agentMessage" {
             if let id = item?["id"]?.stringValue, let phase = item?["phase"]?.stringValue { phases[id] = phase }
-            if item?["phase"]?.stringValue == "final_answer" { onActivity?(.answerStart) }
+            if item?["phase"]?.stringValue == "final_answer" { await onActivity?(.answerStart) }
         } else if method == "item/agentMessage/delta" {
             let id = message["params"]?["itemId"]?.stringValue
-            if id.flatMap({ phases[$0] }) != "commentary" { onActivity?(.answerDelta(message["params"]?["delta"]?.stringValue ?? "")) }
+            if id.flatMap({ phases[$0] }) != "commentary" { await onActivity?(.answerDelta(message["params"]?["delta"]?.stringValue ?? "")) }
         } else if method == "item/started", item?["type"]?.stringValue == "mcpToolCall" {
-            onActivity?(.toolStart(item?["tool"]?.stringValue ?? ""))
+            await onActivity?(.toolStart(item?["tool"]?.stringValue ?? ""))
         } else if method == "item/completed", item?["type"]?.stringValue == "mcpToolCall" {
             let tool = item?["tool"]?.stringValue ?? ""
-            onActivity?(.toolComplete(tool, messagesRead: countReturnedMessages(tool: tool, content: item?["result"]?["structuredContent"])))
+            await onActivity?(.toolComplete(tool, messagesRead: countReturnedMessages(tool: tool, content: item?["result"]?["structuredContent"])))
         } else if method == "item/completed", item?["type"]?.stringValue == "agentMessage" {
             messages.append((item?["phase"]?.stringValue, item?["text"]?.stringValue ?? ""))
-            onActivity?(.writing)
+            await onActivity?(.writing)
         } else if method == "turn/completed", message["params"]?["threadId"]?.stringValue == threadID {
             let status = message["params"]?["turn"]?["status"]?.stringValue ?? "unknown"
             let error = message["params"]?["turn"]?["error"]?["message"]?.stringValue

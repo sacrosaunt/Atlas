@@ -39,5 +39,9 @@ struct AtlasPaths: Sendable {
                 attributes: [.posixPermissions: 0o700]
             )
         }
+        let retiredEmptyHistory = support.appending(path: "history.sqlite")
+        if ((try? FileManager.default.attributesOfItem(atPath: retiredEmptyHistory.path)[.size] as? NSNumber)?.int64Value ?? -1) == 0 {
+            try? FileManager.default.removeItem(at: retiredEmptyHistory)
+        }
     }
 }

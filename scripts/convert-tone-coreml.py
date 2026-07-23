@@ -4,7 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
+import os
 import shutil
+import urllib.request
 from pathlib import Path
 
 import coremltools as ct
@@ -16,6 +20,10 @@ from transformers import AutoModelForSequenceClassification
 
 MODEL_ID = "cardiffnlp/twitter-roberta-base-sentiment-latest"
 MODEL_REVISION = "3216a57f2a0d9c45a2e6c20157c20c49fb4bf9c7"
+MODEL_FILES = (
+    ("config.json", 929, "d2fba19997da698157196ba16f5fcb30a97a7551cef6845a0f3d743ee19c6129"),
+    ("pytorch_model.bin", 501_045_531, "4d24a3e32a88ed1c4e5b789fc6644e2e767500554e954b27dccf52a8e762cbae"),
+)
 BATCH_SIZE = 8
 SEQUENCE_LENGTHS = (32, 64, 128, 256, 512)
 
@@ -48,7 +56,71 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--quantization", choices=("none", "int8"), default="none")
     parser.add_argument("--compute-precision", choices=("float16", "float32"), default="float16")
     parser.add_argument("--sequence-lengths", default=",".join(map(str, SEQUENCE_LENGTHS)))
+    parser.add_argument("--progress", type=Path)
     return parser.parse_args()
+
+
+def report_progress(path: Path | None, phase: str, completed: int, total: int, detail: str) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps({
+        "phase": phase,
+        "completed": completed,
+        "total": total,
+        "detail": detail,
+    }) + "\n")
+    os.replace(temporary, path)
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def download_model(destination: Path, progress: Path | None) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    total_bytes = sum(size for _, size, _ in MODEL_FILES)
+    completed_bytes = 0
+    for filename, expected_size, expected_hash in MODEL_FILES:
+        target = destination / filename
+        if (
+            target.is_file()
+            and target.stat().st_size == expected_size
+            and sha256(target) == expected_hash
+        ):
+            completed_bytes += expected_size
+            continue
+
+        temporary = target.with_suffix(target.suffix + ".download")
+        temporary.unlink(missing_ok=True)
+        url = f"https://huggingface.co/{MODEL_ID}/resolve/{MODEL_REVISION}/{filename}"
+        request = urllib.request.Request(url, headers={"User-Agent": "Atlas-CoreML-Setup/1"})
+        digest = hashlib.sha256()
+        with urllib.request.urlopen(request) as response, temporary.open("wb") as output:
+            file_bytes = 0
+            while chunk := response.read(1024 * 1024):
+                output.write(chunk)
+                digest.update(chunk)
+                file_bytes += len(chunk)
+                transferred = completed_bytes + file_bytes
+                percent = 10 + int(34 * transferred / total_bytes)
+                report_progress(
+                    progress,
+                    "downloading",
+                    percent,
+                    100,
+                    f"Downloading tone model ({transferred / 1_000_000:.0f} of {total_bytes / 1_000_000:.0f} MB)",
+                )
+        if file_bytes != expected_size or digest.hexdigest() != expected_hash:
+            temporary.unlink(missing_ok=True)
+            raise RuntimeError(f"Downloaded {filename} did not match the pinned model")
+        os.replace(temporary, target)
+        completed_bytes += expected_size
 
 
 def main() -> None:
@@ -59,19 +131,29 @@ def main() -> None:
     arguments.cache.mkdir(parents=True, exist_ok=True)
     arguments.output.parent.mkdir(parents=True, exist_ok=True)
 
+    source_directory = arguments.cache / "source"
+    report_progress(arguments.progress, "downloading", 10, 100, "Downloading the pinned tone model")
+    download_model(source_directory, arguments.progress)
     model = AutoModelForSequenceClassification.from_pretrained(
-        MODEL_ID,
-        revision=MODEL_REVISION,
-        cache_dir=arguments.cache,
+        source_directory,
+        local_files_only=True,
         attn_implementation="eager",
     ).eval()
+    report_progress(arguments.progress, "converting", 45, 100, "Preparing the model for Apple silicon")
     wrapped = ToneClassifier(model).eval()
     function_directory = arguments.output.parent / ".tone-coreml-functions"
     if function_directory.exists():
         shutil.rmtree(function_directory)
     function_directory.mkdir(parents=True)
     descriptor = ct.utils.MultiFunctionDescriptor()
-    for length in sequence_lengths:
+    for index, length in enumerate(sequence_lengths):
+        report_progress(
+            arguments.progress,
+            "converting",
+            45 + int(index * 45 / len(sequence_lengths)),
+            100,
+            f"Converting sequence profile {index + 1} of {len(sequence_lengths)}",
+        )
         example_ids = torch.zeros((BATCH_SIZE, length), dtype=torch.int32)
         example_mask = torch.ones((BATCH_SIZE, length), dtype=torch.int32)
         with torch.no_grad():
@@ -114,6 +196,7 @@ def main() -> None:
     ct.utils.save_multifunction(descriptor, str(temporary_output))
     temporary_output.rename(arguments.output)
     shutil.rmtree(function_directory)
+    report_progress(arguments.progress, "compiling", 92, 100, "Compiling the model for this Mac")
     print(arguments.output)
 
 

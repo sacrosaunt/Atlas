@@ -24,6 +24,13 @@ actor SemanticIndex {
     private var indexedDocuments = 0
     private var embeddedDocuments = 0
     private var totalDocuments = 0
+    private var textCompletedOnce = false
+    private var embeddingCompletedOnce = false
+    private var textRunBaseline = 0
+    private var textRunTotal = 0
+    private var textRunTarget = 0
+    private var embeddingRunBaseline = 0
+    private var embeddingRunTotal = 0
     private var downloadedBytes: Int64 = 0
     private var workTask: Task<Void, Never>?
     private var downloadTask: Task<Void, Never>?
@@ -67,6 +74,20 @@ actor SemanticIndex {
 
     func status() -> JSONValue {
         refreshCounts()
+        let textProgress = progress(
+            completed: indexedMessages,
+            total: totalMessages,
+            completedOnce: textCompletedOnce,
+            baseline: textRunBaseline,
+            runTotal: textRunTotal
+        )
+        let embeddingProgress = progress(
+            completed: embeddedDocuments,
+            total: totalDocuments,
+            completedOnce: embeddingCompletedOnce,
+            baseline: embeddingRunBaseline,
+            runTotal: embeddingRunTotal
+        )
         let indexBytes = Self.fileSize(databaseURL) + Self.fileSize(URL(fileURLWithPath: databaseURL.path + "-wal"))
             + Self.fileSize(URL(fileURLWithPath: databaseURL.path + "-shm"))
         return .object([
@@ -78,6 +99,8 @@ actor SemanticIndex {
             "indexed_messages": .number(Double(indexedMessages)), "total_messages": .number(Double(totalMessages)),
             "indexed_documents": .number(Double(indexedDocuments)), "embedded_documents": .number(Double(embeddedDocuments)),
             "total_documents": .number(Double(totalDocuments)), "eta_seconds": currentETA.map(JSONValue.number) ?? .null,
+            "text_progress_completed": .number(Double(textProgress.completed)), "text_progress_total": .number(Double(textProgress.total)),
+            "embedding_progress_completed": .number(Double(embeddingProgress.completed)), "embedding_progress_total": .number(Double(embeddingProgress.total)),
             "preventing_sleep": .bool(sleepAssertion != nil), "index_bytes": .number(Double(indexBytes)),
             "error": error.map(JSONValue.string) ?? .null,
         ])
@@ -205,7 +228,10 @@ actor SemanticIndex {
             textPhase = "indexing"; textError = nil
             let database = try openDatabase()
             let conversations = try store.indexableConversations()
-            totalMessages = conversations.reduce(0) { $0 + $1.messageCount }
+            textRunTarget = conversations.reduce(0) { $0 + $1.messageCount }
+            totalMessages = textRunTarget
+            refreshCounts()
+            beginTextProgressRun()
             for conversation in conversations {
                 try Task.checkCancellation()
                 try database.execute("""
@@ -259,6 +285,7 @@ actor SemanticIndex {
                 }
             }
             textPhase = "ready"
+            markTextCompleted(database)
             await textReadyCallback?()
             try Task.checkCancellation()
             if enabled && isModelInstalled { try await embedPending() }
@@ -290,6 +317,8 @@ actor SemanticIndex {
         INSERT OR REPLACE INTO metadata(key,value) VALUES('vector_dimensions','384');
         INSERT OR REPLACE INTO metadata(key,value) VALUES('model_sha256','\(semanticModelSHA)');
         INSERT OR REPLACE INTO metadata(key,value) VALUES('embedding_order','reverse_chronological_v1');
+        INSERT OR IGNORE INTO metadata(key,value) VALUES('text_index_completed_once','0');
+        INSERT OR IGNORE INTO metadata(key,value) VALUES('embedding_completed_once','0');
         """)
         self.database = database
         return database
@@ -301,11 +330,22 @@ actor SemanticIndex {
         indexedDocuments = (try? database.scalar("SELECT COUNT(*) FROM documents")?.int) ?? 0
         embeddedDocuments = (try? database.scalar("SELECT COUNT(*) FROM documents WHERE embedding IS NOT NULL")?.int) ?? 0
         totalDocuments = indexedDocuments
-        totalMessages = (try? store.info().messages) ?? totalMessages
+        let storedIndexableMessages = (try? database.scalar("SELECT COALESCE(SUM(message_count),0) FROM conversations")?.int) ?? totalMessages
+        totalMessages = textRunTarget > 0 && ["indexing", "paused"].contains(textPhase)
+            ? textRunTarget
+            : storedIndexableMessages
+        textCompletedOnce = (try? database.scalar("SELECT value FROM metadata WHERE key='text_index_completed_once'")?.string) == "1"
+        embeddingCompletedOnce = (try? database.scalar("SELECT value FROM metadata WHERE key='embedding_completed_once'")?.string) == "1"
         if textPhase == "pending" || textPhase == "paused" {
             if indexedMessages >= totalMessages && totalMessages > 0 { textPhase = "ready" }
         }
+        if !textCompletedOnce && indexedMessages >= totalMessages && totalMessages > 0 {
+            markTextCompleted(database)
+        }
         if enabled && isModelInstalled && totalDocuments > 0 && embeddedDocuments >= totalDocuments { phase = "ready" }
+        if !embeddingCompletedOnce && totalDocuments > 0 && embeddedDocuments >= totalDocuments {
+            markEmbeddingCompleted(database)
+        }
     }
 
     private var isModelInstalled: Bool { Self.fileSize(modelURL) == semanticModelBytes }
@@ -327,24 +367,37 @@ actor SemanticIndex {
     }
 
     private func downloadModel() async {
+        var temporaryDownload: URL?
         defer { downloadTask = nil }
         do {
             try? FileManager.default.removeItem(at: partialModelURL)
+            if !isModelInstalled { try? FileManager.default.removeItem(at: modelURL) }
             let delegate = AtlasDownloadDelegate { [weak self] bytes in Task { await self?.setDownloadedBytes(bytes) } }
             let session = URLSession(configuration: .ephemeral, delegate: delegate, delegateQueue: nil)
             let temporary = try await delegate.download(using: session, from: semanticModelURL)
+            temporaryDownload = temporary
             try Task.checkCancellation()
             try FileManager.default.moveItem(at: temporary, to: partialModelURL)
+            temporaryDownload = nil
             guard Self.fileSize(partialModelURL) == semanticModelBytes else { throw SemanticError.unavailable("The downloaded search component had an unexpected size") }
             guard try sha256(partialModelURL) == semanticModelSHA else { throw SemanticError.unavailable("The downloaded search component could not be verified") }
             try FileManager.default.moveItem(at: partialModelURL, to: modelURL)
             phase = foregroundActive ? "preparing" : "paused"
             if foregroundActive { startIndexing() }
-        } catch is CancellationError { phase = enabled ? "off" : "off" }
-        catch { phase = "error"; self.error = error.localizedDescription }
+        } catch is CancellationError {
+            cleanupDownloadArtifacts(temporaryDownload)
+            phase = "off"
+        } catch {
+            cleanupDownloadArtifacts(temporaryDownload)
+            phase = "error"; self.error = error.localizedDescription
+        }
     }
 
     private func setDownloadedBytes(_ value: Int64) { downloadedBytes = value }
+    private func cleanupDownloadArtifacts(_ temporary: URL?) {
+        if let temporary { try? FileManager.default.removeItem(at: temporary) }
+        try? FileManager.default.removeItem(at: partialModelURL)
+    }
 
     private func loadEmbeddingEngine() async throws -> EmbeddingEngine {
         if let embeddingEngine { return embeddingEngine }
@@ -363,6 +416,8 @@ actor SemanticIndex {
         phase = "embedding"; embeddingStartedAt = Date(); embeddingRate = 0; publishedETA = nil; etaPublishedAt = nil
         startSleepAssertion()
         let database = try openDatabase(), engine = try await loadEmbeddingEngine()
+        refreshCounts()
+        beginEmbeddingProgressRun()
         while foregroundActive && enabled {
             try Task.checkCancellation()
             if powerStateShouldPauseEmbedding() { phase = "paused"; stopSleepAssertion(); try await Task.sleep(for: .seconds(2)); continue }
@@ -383,6 +438,35 @@ actor SemanticIndex {
         }
         if !foregroundActive || !enabled { throw CancellationError() }
         phase = "ready"; stopSleepAssertion()
+        refreshCounts()
+        markEmbeddingCompleted(database)
+    }
+
+    private func beginTextProgressRun() {
+        textRunBaseline = textCompletedOnce ? indexedMessages : 0
+        textRunTotal = textCompletedOnce ? max(0, totalMessages - indexedMessages) : totalMessages
+    }
+
+    private func beginEmbeddingProgressRun() {
+        embeddingRunBaseline = embeddingCompletedOnce ? embeddedDocuments : 0
+        embeddingRunTotal = embeddingCompletedOnce ? max(0, totalDocuments - embeddedDocuments) : totalDocuments
+    }
+
+    private func progress(completed: Int, total: Int, completedOnce: Bool, baseline: Int, runTotal: Int) -> (completed: Int, total: Int) {
+        guard completedOnce else { return (min(completed, total), total) }
+        return (min(max(0, completed - baseline), runTotal), runTotal)
+    }
+
+    private func markTextCompleted(_ database: SQLiteDatabase) {
+        guard totalMessages > 0, indexedMessages >= totalMessages else { return }
+        textCompletedOnce = true
+        try? database.execute("UPDATE metadata SET value='1' WHERE key='text_index_completed_once'")
+    }
+
+    private func markEmbeddingCompleted(_ database: SQLiteDatabase) {
+        guard totalDocuments > 0, embeddedDocuments >= totalDocuments else { return }
+        embeddingCompletedOnce = true
+        try? database.execute("UPDATE metadata SET value='1' WHERE key='embedding_completed_once'")
     }
 
     private func startSleepAssertion() {

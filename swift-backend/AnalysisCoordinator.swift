@@ -39,12 +39,25 @@ extension AtlasRuntime {
            let data = content.data(using: .utf8), let decoded = try? JSONDecoder().decode(JSONValue.self, from: data) {
             document = decoded
             if case .object(var object) = document {
-                if case .array(let metrics) = object["metrics"] {
-                    object["metrics"] = .array(metrics.filter {
-                        !($0["label"]?.stringValue?.lowercased().contains("direction") ?? false)
-                    })
-                }
                 if let stats = try? messages.conversationStats(), let totals = stats["totals"] {
+                    let messageCount = totals["messages"]?.intValue ?? 0
+                    let conversationCount = totals["conversations"]?.intValue ?? 0
+                    let generatedMetrics = object["metrics"]?.arrayValue ?? []
+                    let supportingMetric = generatedMetrics.first { metric in
+                        guard let label = metric["label"]?.stringValue?.lowercased() else { return false }
+                        return !label.contains("message")
+                            && !label.contains("conversation")
+                            && !label.contains("direction")
+                    }
+                    var authoritativeMetrics: [JSONValue] = [
+                        insightMetric("Messages", value: messageCount),
+                        insightMetric("Conversations", value: conversationCount),
+                    ]
+                    authoritativeMetrics.append(
+                        supportingMetric ?? insightMetric("People", value: (try? messages.info().people) ?? 0)
+                    )
+                    object["metrics"] = .array(authoritativeMetrics)
+
                     let sent = totals["from_me"]?.intValue ?? 0
                     let received = totals["to_me"]?.intValue ?? 0
                     let total = sent + received
@@ -191,6 +204,13 @@ extension AtlasRuntime {
             try? history.failInsightRefresh(CancellationError())
         } catch { try? history.failInsightRefresh(error) }
     }
+}
+
+private func insightMetric(_ label: String, value: Int) -> JSONValue {
+    .object([
+        "label": .string(label),
+        "value": .string(value.formatted(.number.grouping(.automatic))),
+    ])
 }
 
 private func parseAtlasDate(_ value: String) -> Date? {

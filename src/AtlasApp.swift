@@ -9,6 +9,11 @@ private let tokenPath = NSString(string: "~/Library/Application Support/Atlas/mc
 private let currentOnboardingVersion = 3
 private let firstInsightsNotificationKey = "atlas.firstInsightsNotification.sent"
 
+private func openFullDiskAccessSettings() {
+    guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") else { return }
+    NSWorkspace.shared.open(url)
+}
+
 private extension Notification.Name {
     static let atlasOpenInsights = Notification.Name("AtlasOpenInsights")
     static let atlasOpenSettings = Notification.Name("AtlasOpenSettings")
@@ -49,6 +54,10 @@ private struct HealthResponse: Decodable {
 private struct ChatListResponse: Decodable { let chats: [ChatSummary] }
 private struct ErrorResponse: Decodable { let error: String }
 private struct StopResponse: Decodable { let stopped: Bool }
+private struct FailedMessageDeleteResponse: Decodable {
+    let deleted: Bool
+    let deleted_chat: Bool
+}
 private struct SuggestionResponse: Decodable {
     let suggestions: [String]
     let status: String
@@ -89,6 +98,10 @@ struct SemanticSearchStatus: Decodable, Equatable {
     let indexed_documents: Int
     let embedded_documents: Int
     let total_documents: Int
+    let text_progress_completed: Int
+    let text_progress_total: Int
+    let embedding_progress_completed: Int
+    let embedding_progress_total: Int
     let eta_seconds: Double?
     let preventing_sleep: Bool
     let index_bytes: Int64
@@ -107,9 +120,19 @@ struct SentimentStatus: Decodable, Equatable {
     let total_turns: Int
     let analyzed_windows: Int
     let total_windows: Int
+    let progress_completed_units: Int
+    let progress_total_units: Int
     let eta_seconds: Double?
     let model_revision: String
     let error: String?
+    let coreml_setup: CoreMLSetupStatus?
+}
+
+struct CoreMLSetupStatus: Decodable, Equatable {
+    let phase: String
+    let completed: Int
+    let total: Int
+    let detail: String
 }
 
 struct ToneTrendPoint: Decodable, Identifiable, Equatable {
@@ -189,6 +212,7 @@ struct ChatMessage: Decodable, Identifiable, Hashable {
     let role: String
     let content: String
     let messages_read: Int?
+    let delivery_status: String
     let created_at: String
 }
 
@@ -206,6 +230,7 @@ struct ChatActivity: Decodable, Equatable {
     let detail: String
     let messages_read: Int
     let tool_calls: Int
+    let message_delivered: Bool
     let draft: String?
     let started_at: String?
 }
@@ -278,21 +303,20 @@ private struct ComposerTextHeightPreferenceKey: PreferenceKey {
 }
 
 private struct ChatScrollIntentMonitor: NSViewRepresentable {
-    let onUserScroll: () -> Void
+    let onUserScroll: (Bool) -> Void
 
     final class Coordinator {
-        var onUserScroll: () -> Void
-        private var observer: NSObjectProtocol?
+        var onUserScroll: (Bool) -> Void
         private var eventMonitor: Any?
         private var retryWorkItem: DispatchWorkItem?
         private var retryCount = 0
 
-        init(onUserScroll: @escaping () -> Void) {
+        init(onUserScroll: @escaping (Bool) -> Void) {
             self.onUserScroll = onUserScroll
         }
 
         func attach(to view: NSView) {
-            guard observer == nil else { return }
+            guard eventMonitor == nil else { return }
             guard let scrollView = view.enclosingScrollView else {
                 guard retryWorkItem == nil, retryCount < 20 else { return }
                 retryCount += 1
@@ -309,19 +333,21 @@ private struct ChatScrollIntentMonitor: NSViewRepresentable {
             retryWorkItem = nil
             retryCount = 0
             scrollView.verticalScrollElasticity = .none
-            observer = NotificationCenter.default.addObserver(
-                forName: NSScrollView.willStartLiveScrollNotification,
-                object: scrollView,
-                queue: .main
-            ) { [weak self] _ in
-                self?.onUserScroll()
-            }
             eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) {
                 [weak self, weak scrollView] event in
                 guard let scrollView, event.window === scrollView.window else { return event }
                 let location = scrollView.convert(event.locationInWindow, from: nil)
                 if scrollView.bounds.contains(location) {
-                    self?.onUserScroll()
+                    DispatchQueue.main.async { [weak self, weak scrollView] in
+                        guard let self, let scrollView else { return }
+                        let visible = scrollView.documentVisibleRect
+                        let documentMaxY = scrollView.documentView?.bounds.maxY ?? visible.maxY
+                        let geometryAtBottom = documentMaxY - visible.maxY <= 18
+                        let scrollerAtBottom = scrollView.verticalScroller.map {
+                            $0.knobProportion >= 0.999 || $0.floatValue >= 0.995
+                        } ?? false
+                        self.onUserScroll(geometryAtBottom || scrollerAtBottom)
+                    }
                 }
                 return event
             }
@@ -329,7 +355,6 @@ private struct ChatScrollIntentMonitor: NSViewRepresentable {
 
         deinit {
             retryWorkItem?.cancel()
-            if let observer { NotificationCenter.default.removeObserver(observer) }
             if let eventMonitor { NSEvent.removeMonitor(eventMonitor) }
         }
     }
@@ -378,6 +403,8 @@ final class AtlasModel: ObservableObject {
     @Published var status = "Checking local service…"
     @Published var fullDiskAccessReady = false
     @Published var fullDiskAccessError: String?
+    @Published var healthReachable = false
+    @Published var permissionRecheckInProgress = false
     @Published var serviceExecutable = ""
     @Published var setupReachable = false
     @Published var codexInstalled = false
@@ -452,13 +479,14 @@ final class AtlasModel: ObservableObject {
     func loadInitialData() async {
         await waitForLocalService()
         async let health: Void = checkHealth()
+        async let setup: Void = checkSetup()
         async let history: Void = loadChats()
         async let profile: Void = loadInsights()
         async let semantic: Void = loadSemanticStatus()
         async let tone: Void = loadSentimentStatus()
         async let starters: Void = loadSuggestions()
         async let calendarRefresh: Void = calendar.refresh()
-        _ = await (health, history, profile, semantic, tone, starters, calendarRefresh)
+        _ = await (health, setup, history, profile, semantic, tone, starters, calendarRefresh)
     }
 
     private func waitForLocalService() async {
@@ -482,12 +510,15 @@ final class AtlasModel: ObservableObject {
             let (data, response) = try await URLSession.shared.data(from: serviceURL.appending(path: "api/health"))
             guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
             let health = try JSONDecoder().decode(HealthResponse.self, from: data)
+            healthReachable = true
             status = http.statusCode == 200 && health.ok
                 ? "Local · \(health.conversations ?? 0) conversations"
                 : health.error ?? "Local service needs attention"
             fullDiskAccessReady = http.statusCode == 200 && health.ok
+            fullDiskAccessError = fullDiskAccessReady ? nil : health.error
         } catch {
             status = "Atlas service unavailable"
+            healthReachable = false
             fullDiskAccessReady = false
         }
     }
@@ -520,6 +551,9 @@ final class AtlasModel: ObservableObject {
     }
 
     func restartServiceAndRecheck() async {
+        guard !permissionRecheckInProgress else { return }
+        permissionRecheckInProgress = true
+        defer { permissionRecheckInProgress = false }
         do {
             let _: RestartResponse = try await request(path: "api/restart", method: "POST", body: [:])
         } catch {
@@ -529,7 +563,8 @@ final class AtlasModel: ObservableObject {
         for _ in 0..<24 {
             try? await Task.sleep(for: .milliseconds(750))
             await checkSetup()
-            if setupReachable { return }
+            await checkHealth()
+            if setupReachable && fullDiskAccessReady { return }
         }
     }
 
@@ -654,6 +689,65 @@ final class AtlasModel: ObservableObject {
                 selection = .insights
                 selectedChat = nil
                 prompt = ""
+            }
+            await loadChats()
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+
+    func retryFailedMessage(_ message: ChatMessage, responseProfile: String) async {
+        guard !isSending, message.role == "user", message.delivery_status == "failed",
+              case .chat(let chatID) = selection else { return }
+        isSending = true
+        sendingChatID = chatID
+        chatActivity = ChatActivity(
+            status: "working",
+            detail: "Retrying your message…",
+            messages_read: 0,
+            tool_calls: 0,
+            message_delivered: false,
+            draft: "",
+            started_at: nil
+        )
+        error = nil
+        do {
+            let chat: ChatDetail = try await request(
+                path: "api/chats/\(chatID)/messages/\(message.id)/retry",
+                method: "POST",
+                body: ["response_profile": responseProfile == "faster" ? "faster" : "deeper"]
+            )
+            selectedChat = chat
+            await loadChats()
+            _ = await monitorChat(chatID)
+        } catch {
+            self.error = error.localizedDescription
+            await reloadChatAfterFailure(chatID)
+        }
+        if isSending {
+            withAnimation(.smooth(duration: 0.2)) {
+                isSending = false
+                sendingChatID = nil
+                chatActivity = nil
+            }
+        }
+    }
+
+    func deleteFailedMessage(_ message: ChatMessage) async {
+        guard !isSending, message.role == "user", message.delivery_status == "failed",
+              case .chat(let chatID) = selection else { return }
+        do {
+            let response: FailedMessageDeleteResponse = try await request(
+                path: "api/chats/\(chatID)/messages/\(message.id)",
+                method: "DELETE"
+            )
+            guard response.deleted else { return }
+            if response.deleted_chat {
+                selection = nil
+                selectedChat = nil
+                prompt = ""
+            } else {
+                await loadChat(chatID)
             }
             await loadChats()
         } catch {
@@ -856,6 +950,7 @@ final class AtlasModel: ObservableObject {
             detail: "Understanding your question…",
             messages_read: 0,
             tool_calls: 0,
+            message_delivered: false,
             draft: "",
             started_at: nil
         )
@@ -918,6 +1013,7 @@ final class AtlasModel: ObservableObject {
                     detail: "Stopping…",
                     messages_read: current.messages_read,
                     tool_calls: current.tool_calls,
+                    message_delivered: current.message_delivered,
                     draft: current.draft,
                     started_at: current.started_at
                 )
@@ -970,10 +1066,25 @@ final class AtlasModel: ObservableObject {
             } catch {
                 guard isSending, sendingChatID == id else { return false }
                 self.error = "Atlas lost contact with its local service."
+                await reloadChatAfterFailure(id)
                 return false
             }
         }
         return false
+    }
+
+    private func reloadChatAfterFailure(_ id: String) async {
+        for attempt in 0..<12 {
+            if let chat: ChatDetail = try? await request(path: "api/chats/\(id)") {
+                if case .chat(let selectedID) = selection, selectedID == id {
+                    selectedChat = chat
+                }
+                await loadChats()
+                return
+            }
+            guard attempt < 11 else { return }
+            try? await Task.sleep(for: .milliseconds(200))
+        }
     }
 
     private struct RefreshResponse: Decodable { let status: String }
@@ -1033,6 +1144,7 @@ struct AtlasView: View {
     @State private var chatSearchResultIndex = 0
     @State private var toneTrendRange: ToneTrendRange = .recent
     @State private var chatScrollToBottomRequest = 0
+    @State private var chatBottomScrollGeneration = 0
     @FocusState private var chatSearchFocused: Bool
     @FocusState private var composerFocused: Bool
     @Namespace private var reasoningToggleAnimation
@@ -1053,6 +1165,20 @@ struct AtlasView: View {
         colorScheme == .dark
             ? Color.white.opacity(0.075)
             : Color.white.opacity(0.62)
+    }
+
+    private var chatFollowContentVersion: String {
+        let activity = model.chatActivity
+        return [
+            String(model.selectedChat?.messages.count ?? 0),
+            String(selectedChatIsSending),
+            activity?.status ?? "",
+            activity?.detail ?? "",
+            String(activity?.messages_read ?? 0),
+            String(activity?.tool_calls ?? 0),
+            String(activity?.message_delivered ?? false),
+            String(activity?.draft?.count ?? 0),
+        ].joined(separator: "|")
     }
 
     var body: some View {
@@ -1109,14 +1235,24 @@ struct AtlasView: View {
                 let phase = model.analysis.semanticSearch?.phase ?? ""
                 let textIndexing = model.analysis.semanticSearch?.text_index_phase == "indexing"
                 let tonePhase = model.analysis.sentiment?.phase ?? ""
+                let coreMLPhase = model.analysis.sentiment?.coreml_setup?.phase
+                let coreMLWorking = coreMLPhase.map { !["ready", "failed"].contains($0) } ?? false
                 let delay: Duration = phase == "paused" || tonePhase == "paused"
                     ? .seconds(3)
                     : (textIndexing
+                       || coreMLWorking
                        || ["downloading", "verifying", "indexing", "embedding"].contains(phase)
                        || ["downloading", "preparing", "analyzing"].contains(tonePhase)
                        ? .milliseconds(700)
                        : .seconds(30))
                 try? await Task.sleep(for: delay)
+            }
+        }
+        .task(id: "messages-permission-\(model.lockState)") {
+            guard model.lockState == .unlocked else { return }
+            while !Task.isCancelled && model.lockState == .unlocked {
+                await model.checkHealth()
+                try? await Task.sleep(for: .seconds(model.fullDiskAccessReady ? 15 : 3))
             }
         }
         .task {
@@ -1296,6 +1432,14 @@ struct AtlasView: View {
         }
         .navigationSplitViewStyle(.balanced)
         .tint(accent)
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if model.healthReachable && !model.fullDiskAccessReady {
+                fullDiskAccessRecoveryBanner
+                    .padding(.horizontal, 14)
+                    .padding(.top, 10)
+                    .padding(.bottom, 6)
+            }
+        }
         .alert(
             "Delete conversation?",
             isPresented: Binding(
@@ -1343,6 +1487,51 @@ struct AtlasView: View {
                 .zIndex(20)
             }
         }
+    }
+
+    private var fullDiskAccessRecoveryBanner: some View {
+        HStack(spacing: 14) {
+            Image(systemName: "externaldrive.badge.exclamationmark")
+                .font(.title2)
+                .foregroundStyle(.orange)
+                .frame(width: 34)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Messages access is off")
+                    .font(.headline)
+                Text("Turn Atlas on in Full Disk Access, then restart its local service. Your saved chats and insights remain available.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 14)
+            Button("Open Full Disk Access") {
+                openFullDiskAccessSettings()
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(accent)
+            Button {
+                Task { await model.restartServiceAndRecheck() }
+            } label: {
+                if model.permissionRecheckInProgress {
+                    HStack(spacing: 7) {
+                        ProgressView().controlSize(.small)
+                        Text("Checking…")
+                    }
+                } else {
+                    Text("Restart & Check")
+                }
+            }
+            .buttonStyle(.bordered)
+            .disabled(model.permissionRecheckInProgress)
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 14)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 17, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 17, style: .continuous)
+                .stroke(Color.orange.opacity(0.25), lineWidth: 1)
+        }
+        .shadow(color: .black.opacity(0.08), radius: 12, y: 5)
     }
 
     private var brandHeader: some View {
@@ -2111,33 +2300,24 @@ struct AtlasView: View {
                         .padding(.horizontal, 28)
                         .padding(.top, 28)
                         .animation(.smooth(duration: 0.3), value: model.selectedChat?.messages.count)
-                        .background(ChatScrollIntentMonitor {
+                        .background(ChatScrollIntentMonitor { isAtBottom in
                             guard selectedChatIsSending else { return }
-                            if chatFollowsLiveOutput {
+                            if isAtBottom {
+                                chatFollowsLiveOutput = true
+                            } else if chatFollowsLiveOutput {
                                 chatFollowsLiveOutput = false
                             }
                         })
                     }
                     .onAppear {
-                        chatFollowsLiveOutput = true
-                        DispatchQueue.main.async {
-                            proxy.scrollTo("chat-bottom", anchor: .bottom)
-                        }
+                        requestChatBottomScroll(proxy, animated: false, attach: true)
                     }
                     .onChange(of: model.selection) { _, _ in
-                        chatFollowsLiveOutput = true
                         closeChatSearch(animated: false)
-                        DispatchQueue.main.async {
-                            proxy.scrollTo("chat-bottom", anchor: .bottom)
-                        }
+                        requestChatBottomScroll(proxy, animated: false, attach: true)
                     }
                     .onChange(of: chatScrollToBottomRequest) { _, _ in
-                        chatFollowsLiveOutput = true
-                        DispatchQueue.main.async {
-                            withAnimation(.smooth(duration: 0.24)) {
-                                proxy.scrollTo("chat-bottom", anchor: .bottom)
-                            }
-                        }
+                        requestChatBottomScroll(proxy, animated: true, attach: true)
                     }
                     .onChange(of: selectedChatSearchResult) { _, result in
                         guard let result else { return }
@@ -2146,29 +2326,22 @@ struct AtlasView: View {
                             proxy.scrollTo(result.messageID, anchor: .center)
                         }
                     }
-                    .onChange(of: model.selectedChat?.messages.count) { _, _ in
-                        guard chatFollowsLiveOutput else { return }
-                        proxy.scrollTo("chat-bottom", anchor: .bottom)
-                    }
                     .onChange(of: selectedChatIsSending) { _, sending in
                         if sending {
-                            chatFollowsLiveOutput = true
-                            withAnimation(.smooth(duration: 0.28)) {
-                                proxy.scrollTo("chat-bottom", anchor: .bottom)
-                            }
+                            requestChatBottomScroll(proxy, animated: true, attach: true)
                         }
                     }
-                    .onChange(of: model.chatActivity?.draft?.count) { _, _ in
+                    .onChange(of: chatFollowContentVersion) { _, _ in
                         guard selectedChatIsSending, chatFollowsLiveOutput else { return }
-                        proxy.scrollTo("chat-bottom", anchor: .bottom)
+                        requestChatBottomScroll(proxy, animated: false, attach: false)
                     }
                     .overlay(alignment: .bottomTrailing) {
                         if selectedChatIsSending && !chatFollowsLiveOutput {
                             Button {
                                 withAnimation(.smooth(duration: 0.24)) {
                                     chatFollowsLiveOutput = true
-                                    proxy.scrollTo("chat-bottom", anchor: .bottom)
                                 }
+                                requestChatBottomScroll(proxy, animated: true, attach: true)
                             } label: {
                                 Label("Follow response", systemImage: "arrow.down")
                                     .font(.caption.weight(.semibold))
@@ -2201,6 +2374,10 @@ struct AtlasView: View {
         selectedSearchOccurrence: Int?
     ) -> some View {
         let isOutgoing = message.role == "user"
+        let deliveryFailed = isOutgoing && message.delivery_status == "failed"
+        let deliveryPending = isOutgoing
+            && message.delivery_status == "sending"
+            && !(selectedChatIsSending && model.chatActivity?.message_delivered == true)
         let isSelectedSearchResult = selectedSearchOccurrence != nil
         return HStack {
             if isOutgoing { Spacer(minLength: 90) }
@@ -2210,6 +2387,14 @@ struct AtlasView: View {
                         .font(.caption2.bold()).tracking(1.1).foregroundStyle(.secondary)
                     if !isOutgoing, let count = message.messages_read, count > 0 {
                         messagesReadBadge(count)
+                    } else if deliveryFailed {
+                        Label("Not delivered", systemImage: "exclamationmark.circle.fill")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.red)
+                    } else if deliveryPending {
+                        Text("Sending…")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.secondary)
                     }
                 }
                 MarkdownText(
@@ -2220,7 +2405,29 @@ struct AtlasView: View {
                 )
                 .textSelection(.enabled)
                 .lineSpacing(4)
-                if !isOutgoing {
+                if deliveryFailed {
+                    HStack(spacing: 14) {
+                        Button {
+                            chatFollowsLiveOutput = true
+                            chatScrollToBottomRequest &+= 1
+                            Task { await model.retryFailedMessage(message, responseProfile: responseProfile) }
+                        } label: {
+                            Label("Retry", systemImage: "arrow.clockwise")
+                        }
+                        .foregroundStyle(accent)
+
+                        Button(role: .destructive) {
+                            Task { await model.deleteFailedMessage(message) }
+                        } label: {
+                            Label("Delete", systemImage: "trash")
+                        }
+                        .foregroundStyle(.red)
+                    }
+                    .buttonStyle(.plain)
+                    .font(.caption.weight(.semibold))
+                    .disabled(model.isSending)
+                    .padding(.top, 3)
+                } else if !isOutgoing {
                     HStack {
                         Button {
                             copyResponse(message)
@@ -2240,10 +2447,17 @@ struct AtlasView: View {
                     .padding(.top, 4)
                 }
             }
-            .frame(width: isOutgoing ? outgoingMessageWidth(message.content) : nil, alignment: .leading)
+            .frame(
+                width: isOutgoing
+                    ? max(deliveryFailed ? 150 : 0, outgoingMessageWidth(message.content))
+                    : nil,
+                alignment: .leading
+            )
             .frame(maxWidth: isOutgoing ? nil : .infinity, alignment: .leading)
             .padding(isOutgoing ? 16 : 4)
-            .background(isOutgoing ? AnyShapeStyle(accent.opacity(0.16)) : AnyShapeStyle(Color.clear),
+            .background(isOutgoing
+                        ? AnyShapeStyle(deliveryFailed ? Color.red.opacity(0.12) : accent.opacity(0.16))
+                        : AnyShapeStyle(Color.clear),
                         in: RoundedRectangle(cornerRadius: 17))
             if !isOutgoing { Spacer(minLength: 56) }
         }
@@ -2652,6 +2866,43 @@ struct AtlasView: View {
             || model.insightEvidenceContext != nil
     }
 
+    private func requestChatBottomScroll(
+        _ proxy: ScrollViewProxy,
+        animated: Bool,
+        attach: Bool
+    ) {
+        if attach { chatFollowsLiveOutput = true }
+        chatBottomScrollGeneration &+= 1
+        let generation = chatBottomScrollGeneration
+
+        DispatchQueue.main.async {
+            guard chatFollowsLiveOutput, generation == chatBottomScrollGeneration else { return }
+            if animated {
+                withAnimation(.smooth(duration: 0.24)) {
+                    proxy.scrollTo("chat-bottom", anchor: .bottom)
+                }
+            } else {
+                var transaction = Transaction(animation: nil)
+                transaction.disablesAnimations = true
+                withTransaction(transaction) {
+                    proxy.scrollTo("chat-bottom", anchor: .bottom)
+                }
+            }
+
+            // SwiftUI may insert the outgoing bubble or replace the activity row
+            // after the first scroll target is resolved. Settle once more after
+            // that layout pass so following means the true visual bottom.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) {
+                guard chatFollowsLiveOutput, generation == chatBottomScrollGeneration else { return }
+                var transaction = Transaction(animation: nil)
+                transaction.disablesAnimations = true
+                withTransaction(transaction) {
+                    proxy.scrollTo("chat-bottom", anchor: .bottom)
+                }
+            }
+        }
+    }
+
     private func submitComposer() {
         if isDirectEvidenceExploration {
             model.prompt = "Dig deeper into this evidence."
@@ -2896,20 +3147,43 @@ private struct AtlasSidebarAnalysisProgressView: View {
 
     var body: some View {
         Group {
-            if let semantic = analysis.semanticSearch, semantic.text_index_phase == "indexing" {
+            if let coreML = analysis.sentiment?.coreml_setup,
+               !["ready", "failed"].contains(coreML.phase) {
+                coreMLProgress(coreML)
+            } else if let semantic = analysis.semanticSearch,
+                      ["indexing", "paused"].contains(semantic.text_index_phase) {
                 textIndexProgress(semantic)
-            }
-            if let sentiment = analysis.sentiment,
-               ["downloading", "preparing", "analyzing", "paused", "waiting_for_app"].contains(sentiment.phase) {
+            } else if let sentiment = analysis.sentiment,
+                      ["downloading", "preparing", "analyzing", "paused", "waiting_for_app"].contains(sentiment.phase) {
                 sentimentProgress(sentiment)
             } else if let semantic = analysis.semanticSearch,
-                      semantic.text_index_phase != "indexing",
                       ["downloading", "verifying", "indexing", "embedding", "paused"].contains(semantic.phase) {
                 semanticProgress(semantic)
             }
         }
         .padding(.horizontal, 14)
         .padding(.bottom, 8)
+    }
+
+    private func coreMLProgress(_ status: CoreMLSetupStatus) -> some View {
+        let fraction = status.total > 0 ? min(1, Double(status.completed) / Double(status.total)) : 0
+        return VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 7) {
+                Image(systemName: status.phase == "downloading" ? "arrow.down.circle" : "cpu")
+                    .foregroundStyle(accent)
+                Text(status.detail).font(.caption.weight(.semibold)).lineLimit(1)
+                Spacer(minLength: 4)
+                Text(fraction.formatted(.percent.precision(.fractionLength(0))))
+                    .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+            }
+            ProgressView(value: fraction).tint(accent)
+            Text(status.phase == "downloading"
+                 ? "Downloading once for faster private analysis"
+                 : "Preparing Apple-optimized tone analysis")
+                .font(.caption2).foregroundStyle(.secondary)
+        }
+        .padding(11)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 13))
     }
 
     private func semanticProgress(_ status: SemanticSearchStatus) -> some View {
@@ -2921,10 +3195,10 @@ private struct AtlasSidebarAnalysisProgressView: View {
         let usesEmbeddingProgress = isEmbedding || isPaused
         let completed = isTransfer
             ? status.downloaded_bytes
-            : Int64(usesEmbeddingProgress ? status.embedded_documents : status.indexed_messages)
+            : Int64(usesEmbeddingProgress ? status.embedding_progress_completed : status.text_progress_completed)
         let total = isTransfer
             ? status.total_download_bytes
-            : Int64(usesEmbeddingProgress ? status.total_documents : status.total_messages)
+            : Int64(usesEmbeddingProgress ? status.embedding_progress_total : status.text_progress_total)
         let fraction = total > 0 ? min(1, Double(completed) / Double(total)) : 0
         return VStack(alignment: .leading, spacing: 7) {
             HStack(spacing: 7) {
@@ -2952,8 +3226,8 @@ private struct AtlasSidebarAnalysisProgressView: View {
             } else if isVerifying {
                 Text("Checking the downloaded file before loading it")
                     .font(.caption2).foregroundStyle(.secondary)
-            } else if !isDownloading, status.total_messages > 0 {
-                Text("\(status.indexed_messages.formatted()) of \(status.total_messages.formatted()) messages")
+            } else if !isDownloading, status.text_progress_total > 0 {
+                Text("\(status.text_progress_completed.formatted()) of \(status.text_progress_total.formatted()) messages")
                     .font(.caption2).foregroundStyle(.secondary)
             }
         }
@@ -2964,10 +3238,8 @@ private struct AtlasSidebarAnalysisProgressView: View {
     private func sentimentProgress(_ status: SentimentStatus) -> some View {
         let isDownloading = status.phase == "downloading"
         let isPaused = ["paused", "waiting_for_app"].contains(status.phase)
-        let completedUnits = status.analyzed_turns + status.analyzed_windows
-        let totalUnits = status.total_turns + status.total_windows
-        let completed = isDownloading ? status.downloaded_bytes : Int64(completedUnits)
-        let total = isDownloading ? status.total_download_bytes : Int64(totalUnits)
+        let completed = isDownloading ? status.downloaded_bytes : Int64(status.progress_completed_units)
+        let total = isDownloading ? status.total_download_bytes : Int64(status.progress_total_units)
         let fraction = total > 0 ? min(1, Double(completed) / Double(total)) : 0
         return VStack(alignment: .leading, spacing: 7) {
             HStack(spacing: 7) {
@@ -2998,21 +3270,25 @@ private struct AtlasSidebarAnalysisProgressView: View {
     }
 
     private func textIndexProgress(_ status: SemanticSearchStatus) -> some View {
-        let fraction = status.total_messages > 0
-            ? min(1, Double(status.indexed_messages) / Double(status.total_messages))
+        let isPaused = status.text_index_phase == "paused"
+        let fraction = status.text_progress_total > 0
+            ? min(1, Double(status.text_progress_completed) / Double(status.text_progress_total))
             : 0
         return VStack(alignment: .leading, spacing: 7) {
             HStack(spacing: 7) {
                 Image(systemName: "text.magnifyingglass").foregroundStyle(accent)
-                Text("Preparing fast search…")
+                Text(isPaused ? "Fast search paused" : "Preparing fast search…")
                     .font(.caption.weight(.semibold)).lineLimit(1)
                 Spacer(minLength: 4)
                 Text(fraction.formatted(.percent.precision(.fractionLength(0))))
                     .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
             }
             ProgressView(value: fraction).tint(accent)
-            if status.total_messages > 0 {
-                Text("\(status.indexed_messages.formatted()) of \(status.total_messages.formatted()) messages")
+            if isPaused {
+                Text(atlasPauseText(status.pause_reason))
+                    .font(.caption2).foregroundStyle(.secondary)
+            } else if status.text_progress_total > 0 {
+                Text("\(status.text_progress_completed.formatted()) of \(status.text_progress_total.formatted()) messages")
                     .font(.caption2).foregroundStyle(.secondary)
             }
         }
@@ -3077,6 +3353,8 @@ private struct AtlasSettingsView: View {
                     .padding(18)
                     .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
 
+                    messagesAccessSettingsCard
+
                     calendarSettingsCard
 
                     VStack(alignment: .leading, spacing: 16) {
@@ -3108,6 +3386,7 @@ private struct AtlasSettingsView: View {
         .frame(width: 570, height: 590)
         .task {
             await calendar.refresh()
+            await model.checkHealth()
             await model.loadSemanticStatus()
             while !Task.isCancelled {
                 let active = analysis.semanticSearch?.text_index_phase == "indexing"
@@ -3124,6 +3403,56 @@ private struct AtlasSettingsView: View {
         } message: {
             Text("This deletes the downloaded component and semantic optimization data. Your Messages database is not changed.")
         }
+    }
+
+    private var messagesAccessSettingsCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top, spacing: 14) {
+                Image(systemName: model.fullDiskAccessReady ? "externaldrive.badge.checkmark" : "externaldrive.badge.exclamationmark")
+                    .font(.title2)
+                    .foregroundStyle(model.fullDiskAccessReady ? .green : .orange)
+                    .frame(width: 34)
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Messages access").font(.headline)
+                    Text(model.fullDiskAccessReady
+                         ? "Atlas can access your local Messages history."
+                         : "Turn Atlas on under Full Disk Access, then restart its local service.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            HStack(spacing: 10) {
+                Label(
+                    model.fullDiskAccessReady ? "Connected" : "Permission required",
+                    systemImage: model.fullDiskAccessReady ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
+                )
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(model.fullDiskAccessReady ? .green : .orange)
+                Spacer()
+                Button(model.fullDiskAccessReady ? "Manage Access" : "Open Full Disk Access") {
+                    openFullDiskAccessSettings()
+                }
+                .buttonStyle(.bordered)
+                if !model.fullDiskAccessReady {
+                    Button {
+                        Task { await model.restartServiceAndRecheck() }
+                    } label: {
+                        if model.permissionRecheckInProgress {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Text("Restart & Check")
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(accent)
+                    .disabled(model.permissionRecheckInProgress)
+                }
+            }
+        }
+        .padding(20)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
     }
 
     private var calendarSettingsCard: some View {
@@ -3237,14 +3566,14 @@ private struct AtlasSettingsView: View {
                         Text("Preparing your message history…")
                             .font(.subheadline.weight(.semibold))
                         Spacer()
-                        if status.total_messages > 0 {
-                            Text("\(status.indexed_messages.formatted()) of \(status.total_messages.formatted())")
+                        if status.text_progress_total > 0 {
+                            Text("\(status.text_progress_completed.formatted()) of \(status.text_progress_total.formatted())")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                     }
                     ProgressView(
-                        value: status.total_messages > 0
-                            ? min(1, Double(status.indexed_messages) / Double(status.total_messages))
+                        value: status.text_progress_total > 0
+                            ? min(1, Double(status.text_progress_completed) / Double(status.text_progress_total))
                             : 0
                     ).tint(accent)
                     Text("You can keep using Atlas while this finishes.")
@@ -3260,8 +3589,8 @@ private struct AtlasSettingsView: View {
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     ProgressView(
-                        value: status.total_documents > 0
-                            ? min(1, Double(status.embedded_documents) / Double(status.total_documents))
+                        value: status.embedding_progress_total > 0
+                            ? min(1, Double(status.embedding_progress_completed) / Double(status.embedding_progress_total))
                             : 0
                     ).tint(accent)
                     Text("Fast text search is ready. Related-meaning results improve while Atlas remains open.")
@@ -3272,16 +3601,30 @@ private struct AtlasSettingsView: View {
                     }
                 }
             case "paused":
-                VStack(alignment: .leading, spacing: 8) {
-                    Label("Optimization paused", systemImage: "pause.circle.fill")
-                        .font(.subheadline.weight(.semibold)).foregroundStyle(.orange)
-                    ProgressView(
-                        value: status.total_documents > 0
-                            ? min(1, Double(status.embedded_documents) / Double(status.total_documents))
-                            : 0
-                    ).tint(accent)
-                    Text(atlasPauseText(status.pause_reason))
-                        .font(.caption).foregroundStyle(.secondary)
+                if status.text_index_phase == "paused" {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Label("Fast search paused", systemImage: "pause.circle.fill")
+                            .font(.subheadline.weight(.semibold)).foregroundStyle(.orange)
+                        ProgressView(
+                            value: status.text_progress_total > 0
+                                ? min(1, Double(status.text_progress_completed) / Double(status.text_progress_total))
+                                : 0
+                        ).tint(accent)
+                        Text(atlasPauseText(status.pause_reason))
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                } else {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Label("Optimization paused", systemImage: "pause.circle.fill")
+                            .font(.subheadline.weight(.semibold)).foregroundStyle(.orange)
+                        ProgressView(
+                            value: status.embedding_progress_total > 0
+                                ? min(1, Double(status.embedding_progress_completed) / Double(status.embedding_progress_total))
+                                : 0
+                        ).tint(accent)
+                        Text(atlasPauseText(status.pause_reason))
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                 }
             case "ready":
                 Label("Enhanced search is on", systemImage: "checkmark.circle.fill")
@@ -3691,7 +4034,7 @@ private struct AtlasOnboardingView: View {
                         HStack {
                             Text("Downloading…").font(.caption.weight(.semibold))
                             Spacer()
-                            Text("\(onboardingByteCount(tone.downloaded_bytes)) of 130 MB")
+                            Text("\(onboardingByteCount(tone.downloaded_bytes)) of \(onboardingByteCount(tone.total_download_bytes))")
                                 .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                         }
                         ProgressView(
@@ -3810,9 +4153,7 @@ private struct AtlasOnboardingView: View {
                 readyText: "Messages accessible",
                 missingText: "Permission required"
             ) {
-                if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
-                    NSWorkspace.shared.open(url)
-                }
+                openFullDiskAccessSettings()
             } actionLabel: {
                 "Open Settings"
             }

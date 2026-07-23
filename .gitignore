@@ -3,6 +3,8 @@ node_modules/
 .build/
 .swiftpm/
 .venv*/
+__pycache__/
+*.py[cod]
 bin/
 *.log
 *.sqlite

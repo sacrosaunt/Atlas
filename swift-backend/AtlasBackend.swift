@@ -9,6 +9,8 @@ private let atlasLeaseSeconds: TimeInterval = 15
 @main
 struct AtlasBackendMain {
     static func main() async throws {
+        Darwin.signal(SIGTERM) { _ in Darwin._exit(0) }
+        Darwin.signal(SIGINT) { _ in Darwin._exit(0) }
         if CommandLine.arguments.contains("--verify-tone-runtime") {
             let paths = AtlasPaths()
             let result = try verifyToneRuntime(at: paths.toneDirectory)
@@ -346,6 +348,54 @@ private func mountCoreRoutes(_ router: Router<BasicRequestContext>, runtime: Atl
             return try atlasError(ChatCoordinatorError.tooMany.localizedDescription, status: .tooManyRequests)
         } catch {
             return try atlasError("Atlas couldn't complete that request. Please try again.", status: .internalServerError)
+        }
+    }
+
+    router.post("/api/chats/{id}/messages/{messageID}/retry") { request, context -> Response in
+        guard await runtime.authorized(request) else { return try atlasUnauthorized() }
+        guard await runtime.consentAccepted() else { return try atlasConsentRequired() }
+        guard await runtime.isActive() else { return try atlasActiveRequired() }
+        guard let id = context.parameters.get("id", as: String.self),
+              let rawMessageID = context.parameters.get("messageID", as: String.self),
+              let messageID = Int(rawMessageID) else {
+            return try atlasError("Message not found", status: .notFound)
+        }
+        let body = try await atlasBody(request, context: context)
+        do {
+            let chat = try await runtime.retryMessage(
+                chatID: id,
+                messageID: messageID,
+                profile: body["response_profile"]?.stringValue == "faster" ? "faster" : "deeper"
+            )
+            return try atlasEncodableResponse(chat, status: .accepted)
+        } catch ChatCoordinatorError.tooMany {
+            return try atlasError(ChatCoordinatorError.tooMany.localizedDescription, status: .tooManyRequests)
+        } catch ChatCoordinatorError.alreadyRunning {
+            return try atlasError(ChatCoordinatorError.alreadyRunning.localizedDescription, status: .conflict)
+        } catch ChatCoordinatorError.notFound {
+            return try atlasError("Conversation not found", status: .notFound)
+        } catch {
+            return try atlasError(error.localizedDescription, status: .conflict)
+        }
+    }
+
+    router.delete("/api/chats/{id}/messages/{messageID}") { request, context -> Response in
+        guard await runtime.authorized(request) else { return try atlasUnauthorized() }
+        guard let id = context.parameters.get("id", as: String.self),
+              let rawMessageID = context.parameters.get("messageID", as: String.self),
+              let messageID = Int(rawMessageID) else {
+            return try atlasError("Message not found", status: .notFound)
+        }
+        do {
+            let deletedChat = try await runtime.deleteFailedMessage(chatID: id, messageID: messageID)
+            return try atlasResponse(.object([
+                "deleted": .bool(true),
+                "deleted_chat": .bool(deletedChat),
+            ]))
+        } catch ChatCoordinatorError.alreadyRunning {
+            return try atlasError(ChatCoordinatorError.alreadyRunning.localizedDescription, status: .conflict)
+        } catch {
+            return try atlasError(error.localizedDescription, status: .conflict)
         }
     }
 

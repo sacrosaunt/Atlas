@@ -42,8 +42,13 @@ final class IMessageStore: @unchecked Sendable {
             let database = try openDatabase()
             let row = try database.query("""
             SELECT
-              (SELECT COUNT(*) FROM message) AS messages,
-              (SELECT COUNT(*) FROM chat) AS conversations,
+              (SELECT COUNT(*) FROM message WHERE item_type = 0) AS messages,
+              (SELECT COUNT(*) FROM chat c WHERE EXISTS (
+                SELECT 1 FROM chat_message_join cmj
+                JOIN message m ON m.ROWID = cmj.message_id
+                WHERE cmj.chat_id = c.ROWID AND m.item_type = 0
+                LIMIT 1
+              )) AS conversations,
               (SELECT COUNT(*) FROM handle) AS handles
             """).first ?? [:]
             return .init(

@@ -92,7 +92,8 @@ the question.
 ## Requirements and install
 
 - Apple silicon Mac running macOS 15 or newer
-- Xcode Command Line Tools with Swift 6.1 or newer
+- Xcode Command Line Tools with Swift 6.2 or newer
+- Python 3.9–3.12 (optional; enables automatic first-run Core ML conversion)
 - the official Codex CLI installed and logged in
 - Full Disk Access for `Atlas.app`
 
@@ -102,13 +103,17 @@ cd Atlas
 ./scripts/install.sh
 ```
 
-The installer builds the Swift backend and UI, copies the native llama and ONNX
-runtimes, and ad-hoc signs `~/Applications/Atlas.app`. The app starts and
-supervises the separate backend only while Atlas is open. Atlas prefers the
-optional precompiled Core ML tone package at `assets/ToneClassifier.mlpackage`
-and otherwise runs the verified downloaded tone model through ONNX Runtime.
-Source builders can create the faster Core ML asset with
-`scripts/convert-tone-coreml.py`.
+The installer builds the Swift backend and UI, bundles the native llama and ONNX
+runtimes plus a pinned Core ML conversion recipe, and ad-hoc signs
+`~/Applications/Atlas.app`. On first launch, Atlas prepares a private Python
+environment, downloads the pinned public tone classifier, and converts and
+compiles it for Core ML. Existing output is reused on later installs. If
+conversion cannot run, Atlas remains functional through its verified ONNX
+Runtime fallback. Download, conversion, indexing, and analysis progress is
+reported in the sidebar setup card. After compilation succeeds, Atlas deletes
+the source weights, private conversion environment, intermediate model package,
+and incomplete downloads. The app starts and supervises the separate backend
+only while Atlas is open.
 
 Older installs can remove the retired Login Agent while preserving the app and local data:
 
@@ -135,8 +140,6 @@ config/          App property list
 scripts/         Install, uninstall, and model conversion tools
 src/             SwiftUI interface and Calendar snapshot bridge
 swift-backend/   Standalone Swift API, MCP, indexes, models, and Codex bridge
-swift-backend-tests/  Native tests
 ```
 
-Persistent state lives under `~/Library/Application Support/Atlas`. Logs are
-written to `~/Library/Logs/Atlas.log` and `~/Library/Logs/Atlas.error.log`.
+Persistent state lives under `~/Library/Application Support/Atlas`.

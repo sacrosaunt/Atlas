@@ -12,13 +12,10 @@ private struct ToneModelFile: Sendable {
 private let toneRevision = "f3ec4d0925f90c3ca7ee7814f52d6ee7cf180445"
 private let toneFiles = [
     ToneModelFile(path: "onnx/model_quantized.onnx", bytes: 125_905_426, sha256: "046f7e4cc46b399558fa9b2de966f6b0d42c69e4b01f582bfb4099b01a0bb5d7"),
-    ToneModelFile(path: "config.json", bytes: 887, sha256: "cdf2b36e0066bd9996e3b9fb3f7c095dc656a0e62c6e3a7327d4ff5541e55b51"),
-    ToneModelFile(path: "tokenizer.json", bytes: 2_108_615, sha256: "1e6506713f00e34406a757acb80f9f3233c1c3950857d32bbc41bcd419d5d8b6"),
-    ToneModelFile(path: "tokenizer_config.json", bytes: 1_243, sha256: "09cb41b20740b45cbbb801d5f66d764cb85a7a62204e999d70f897d05f9f8592"),
     ToneModelFile(path: "merges.txt", bytes: 456_318, sha256: "1ce1664773c50f3e0cc8842619a93edc4624525b728b188a9e0be33b7726adc5"),
     ToneModelFile(path: "vocab.json", bytes: 798_293, sha256: "ed19656ea1707df69134c4af35c8ceda2cc9860bf2c3495026153a133670ab5e"),
-    ToneModelFile(path: "special_tokens_map.json", bytes: 958, sha256: "f23c8e6099631c233c16d9bf8dab198f610826cdd1b358f270f6d55c1863e857"),
 ]
+private let disposableToneMetadata = ["config.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"]
 private let toneDownloadBytes = toneFiles.reduce(Int64(0)) { $0 + $1.bytes }
 
 actor ToneIndex {
@@ -26,6 +23,9 @@ actor ToneIndex {
     private let directory: URL
     private let modelDirectory: URL
     private let coreMLPackage: URL
+    private let coreMLCompiledModel: URL
+    private let coreMLSetupProgress: URL
+    private let coreMLSetupScript: URL
     private let markerURL: URL
     private let settingsURL: URL
     private var database: SQLiteDatabase?
@@ -39,12 +39,17 @@ actor ToneIndex {
     private var analyzedTurns = 0
     private var totalWindows = 0
     private var analyzedWindows = 0
+    private var completedOnce = false
+    private var runBaseline = 0
+    private var runTotal = 0
     private var rate = 0.0
     private var startedAt: Date?
     private var publishedETA: Double?
     private var etaPublishedAt: Date?
     private var task: Task<Void, Never>?
     private var downloadTask: Task<Void, Never>?
+    private var coreMLPreparation: CoreMLPreparationProcess?
+    private var coreMLPreparationID: UUID?
     private var classifier: NativeToneClassifier?
     private var inferenceBackend: String?
     private var sleepAssertion: Process?
@@ -54,11 +59,28 @@ actor ToneIndex {
         self.directory = directory
         modelDirectory = directory.appending(path: "model", directoryHint: .isDirectory)
         coreMLPackage = directory.appending(path: "coreml/ToneClassifier.mlpackage")
+        coreMLCompiledModel = directory.appending(path: "coreml/ToneClassifier.mlmodelc")
+        coreMLSetupProgress = directory.appending(path: "coreml/setup-progress.json")
+        let executable = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL
+        let bundledSetup = executable.deletingLastPathComponent().deletingLastPathComponent()
+            .appending(path: "Resources/CoreMLSetup/prepare-tone-coreml.sh")
+        let developmentSetup = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appending(path: "scripts/prepare-tone-coreml.sh")
+        coreMLSetupScript = FileManager.default.isExecutableFile(atPath: bundledSetup.path)
+            ? bundledSetup
+            : developmentSetup
         markerURL = directory.appending(path: "model/verified.json")
         settingsURL = directory.appending(path: "settings.json")
         enabled = Self.readEnabled(directory.appending(path: "settings.json"))
         phase = enabled ? "starting" : "off"
-        inferenceBackend = FileManager.default.fileExists(atPath: directory.appending(path: "coreml/ToneClassifier.mlpackage").path) ? "coreml" : nil
+        inferenceBackend = FileManager.default.fileExists(atPath: coreMLCompiledModel.path)
+            || FileManager.default.fileExists(atPath: coreMLPackage.path) ? "coreml" : nil
+        if Self.compiledModelIsValid(coreMLCompiledModel) {
+            Self.removeDisposableCoreMLArtifacts(package: coreMLPackage)
+        }
+        for filename in disposableToneMetadata {
+            try? FileManager.default.removeItem(at: modelDirectory.appending(path: filename))
+        }
         try? FileManager.default.createDirectory(at: modelDirectory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
     }
 
@@ -69,15 +91,22 @@ actor ToneIndex {
 
     func setForegroundActive(_ active: Bool) {
         foregroundActive = active
-        if active { scheduleIfPossible() }
+        if active {
+            startCoreMLPreparationIfNeeded()
+            scheduleIfPossible()
+        }
         else {
             task?.cancel(); task = nil; stopSleepAssertion()
+            coreMLPreparation?.terminate(); coreMLPreparation = nil; coreMLPreparationID = nil
             if enabled && isInstalled && !["ready", "downloading", "off", "error"].contains(phase) { phase = "waiting_for_app" }
         }
     }
 
     func status() -> JSONValue {
         refreshCounts()
+        let progress = analysisProgress
+        let coreMLProgress = (try? Data(contentsOf: coreMLSetupProgress))
+            .flatMap { try? JSONDecoder().decode(JSONValue.self, from: $0) }
         return .object([
             "enabled": .bool(enabled), "installed": .bool(isInstalled), "phase": .string(phase),
             "pause_reason": phase == "waiting_for_app" ? .string("app_not_active") : .null,
@@ -86,14 +115,17 @@ actor ToneIndex {
             "total_download_bytes": .number(Double(toneDownloadBytes)),
             "analyzed_turns": .number(Double(analyzedTurns)), "total_turns": .number(Double(totalTurns)),
             "analyzed_windows": .number(Double(analyzedWindows)), "total_windows": .number(Double(totalWindows)),
+            "progress_completed_units": .number(Double(progress.completed)), "progress_total_units": .number(Double(progress.total)),
             "eta_seconds": currentETA.map(JSONValue.number) ?? .null,
             "inference_backend": inferenceBackend.map(JSONValue.string) ?? .null,
+            "coreml_setup": coreMLProgress ?? .null,
             "model_revision": .string(toneRevision), "error": error.map(JSONValue.string) ?? .null,
         ])
     }
 
     func enable() -> JSONValue {
         enabled = true; error = nil; saveSettings()
+        if foregroundActive { startCoreMLPreparationIfNeeded() }
         if modelFilesInstalled { scheduleIfPossible() } else { startDownload() }
         return status()
     }
@@ -176,6 +208,7 @@ actor ToneIndex {
     private func scheduleIfPossible() {
         guard enabled else { phase = "off"; return }
         guard modelFilesInstalled else { phase = downloadTask == nil ? "not_downloaded" : "downloading"; return }
+        guard coreMLPreparation == nil else { phase = "preparing"; return }
         guard foregroundActive else { phase = "waiting_for_app"; return }
         guard textIndexReady else { phase = "waiting_for_index"; return }
         guard task == nil else { return }
@@ -185,15 +218,53 @@ actor ToneIndex {
         }
     }
 
+    private func startCoreMLPreparationIfNeeded() {
+        guard enabled,
+              coreMLPreparation == nil,
+              !FileManager.default.fileExists(atPath: coreMLCompiledModel.path),
+              FileManager.default.isExecutableFile(atPath: coreMLSetupScript.path) else { return }
+        let preparation = CoreMLPreparationProcess()
+        let preparationID = UUID()
+        coreMLPreparation = preparation
+        coreMLPreparationID = preparationID
+        do {
+            try preparation.start(script: coreMLSetupScript) { [weak self] status in
+                Task { await self?.coreMLPreparationFinished(id: preparationID, status: status) }
+            }
+        } catch {
+            coreMLPreparation = nil
+            coreMLPreparationID = nil
+            self.error = "Core ML setup could not start: \(error.localizedDescription)"
+        }
+    }
+
+    private func coreMLPreparationFinished(id: UUID, status: Int32) {
+        guard coreMLPreparationID == id else { return }
+        coreMLPreparation = nil
+        coreMLPreparationID = nil
+        if status == 0,
+           FileManager.default.fileExists(atPath: coreMLCompiledModel.path)
+            || FileManager.default.fileExists(atPath: coreMLPackage.path) {
+            inferenceBackend = "coreml"
+            task?.cancel()
+            task = nil
+        }
+        scheduleIfPossible()
+    }
+
     private func analyze() async {
         defer { task = nil; classifier = nil; stopSleepAssertion() }
         do {
             phase = "preparing"; error = nil
-            let database = try openDatabase(); try materialize(database)
+            let database = try openDatabase()
+            refreshCounts()
+            try materialize(database)
+            beginProgressRun()
             phase = "analyzing"; startedAt = Date(); rate = 0; publishedETA = nil; etaPublishedAt = nil
             startSleepAssertion()
             let classifier = try NativeToneClassifier(
                 modelPackage: coreMLPackage,
+                compiledModel: coreMLCompiledModel,
                 onnxModel: modelDirectory.appending(path: "onnx/model_quantized.onnx"),
                 modelDirectory: modelDirectory
             )
@@ -225,7 +296,7 @@ actor ToneIndex {
                 }
             }
             guard foregroundActive && enabled else { throw CancellationError() }
-            phase = "ready"; refreshCounts()
+            phase = "ready"; refreshCounts(); markCompleted(database)
         } catch is CancellationError {
             phase = enabled ? "waiting_for_app" : "off"
         } catch {
@@ -265,6 +336,7 @@ actor ToneIndex {
         CREATE TABLE IF NOT EXISTS sentiment_windows(id INTEGER PRIMARY KEY,conversation_id TEXT NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,start_message_id INTEGER NOT NULL,end_message_id INTEGER NOT NULL,start_at TEXT,end_at TEXT,turn_count INTEGER NOT NULL,directions TEXT NOT NULL,text TEXT NOT NULL,negative REAL,neutral REAL,positive REAL,valence REAL,confidence REAL,UNIQUE(conversation_id,start_message_id,end_message_id));
         CREATE INDEX IF NOT EXISTS sentiment_windows_dates ON sentiment_windows(start_at,end_at); CREATE INDEX IF NOT EXISTS sentiment_windows_pending ON sentiment_windows(end_at DESC,id DESC) WHERE positive IS NULL;
         INSERT OR REPLACE INTO sentiment_metadata(key,value) VALUES('model_version','cardiff-twitter-roberta-coreml-fp16:3216a57f2a0d9c45a2e6c20157c20c49fb4bf9c7:safe-mask-v1');
+        INSERT OR IGNORE INTO sentiment_metadata(key,value) VALUES('completed_once','0');
         """)
     }
 
@@ -279,7 +351,33 @@ actor ToneIndex {
         analyzedTurns = (try? database.scalar("SELECT COUNT(*) FROM sentiment_turns WHERE positive IS NOT NULL")?.int) ?? 0
         totalWindows = (try? database.scalar("SELECT COUNT(*) FROM sentiment_windows")?.int) ?? 0
         analyzedWindows = (try? database.scalar("SELECT COUNT(*) FROM sentiment_windows WHERE positive IS NOT NULL")?.int) ?? 0
+        completedOnce = (try? database.scalar("SELECT value FROM sentiment_metadata WHERE key='completed_once'")?.string) == "1"
         if totalTurns + totalWindows > 0 && analyzedTurns + analyzedWindows >= totalTurns + totalWindows { phase = "ready" }
+        if !completedOnce && totalTurns + totalWindows > 0 && analyzedTurns + analyzedWindows >= totalTurns + totalWindows {
+            markCompleted(database)
+        }
+    }
+
+    private var analysisProgress: (completed: Int, total: Int) {
+        let analyzed = analyzedTurns + analyzedWindows
+        let total = totalTurns + totalWindows
+        guard completedOnce else { return (min(analyzed, total), total) }
+        return (min(max(0, analyzed - runBaseline), runTotal), runTotal)
+    }
+
+    private func beginProgressRun() {
+        let analyzed = analyzedTurns + analyzedWindows
+        let total = totalTurns + totalWindows
+        runBaseline = completedOnce ? analyzed : 0
+        runTotal = completedOnce ? max(0, total - analyzed) : total
+    }
+
+    private func markCompleted(_ database: SQLiteDatabase) {
+        let analyzed = analyzedTurns + analyzedWindows
+        let total = totalTurns + totalWindows
+        guard total > 0, analyzed >= total else { return }
+        completedOnce = true
+        try? database.execute("UPDATE sentiment_metadata SET value='1' WHERE key='completed_once'")
     }
 
     private var currentETA: Double? {
@@ -301,6 +399,7 @@ actor ToneIndex {
     }
 
     private func download() async {
+        var temporaryDownload: URL?
         defer { downloadTask = nil }
         do {
             try? FileManager.default.removeItem(at: markerURL)
@@ -309,21 +408,62 @@ actor ToneIndex {
                 let destination = modelDirectory.appending(path: file.path), partial = URL(fileURLWithPath: destination.path + ".part")
                 try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
                 try? FileManager.default.removeItem(at: partial)
+                if fileSize(destination) == file.bytes, (try? hash(destination)) == file.sha256 {
+                    downloadedBytes += file.bytes
+                    continue
+                }
+                try? FileManager.default.removeItem(at: destination)
                 let before = downloadedBytes
                 let delegate = ToneDownloadDelegate { [weak self] bytes in Task { await self?.setDownloadProgress(before + bytes) } }
                 let source = URL(string: "https://huggingface.co/Xenova/twitter-roberta-base-sentiment-latest/resolve/\(toneRevision)/\(file.path)")!
                 let temporary = try await delegate.download(from: source)
+                temporaryDownload = temporary
                 try FileManager.default.moveItem(at: temporary, to: partial)
+                temporaryDownload = nil
                 guard fileSize(partial) == file.bytes, try hash(partial) == file.sha256 else { throw ToneError.invalidDownload }
                 try FileManager.default.moveItem(at: partial, to: destination); downloadedBytes = before + file.bytes
             }
             try AtlasSecurity.writePrivate(Data("{\"revision\":\"\(toneRevision)\"}\n".utf8), to: markerURL)
             scheduleIfPossible()
-        } catch is CancellationError { phase = enabled ? "not_downloaded" : "off" }
-        catch { phase = "error"; self.error = error.localizedDescription }
+        } catch is CancellationError {
+            cleanupToneDownloadArtifacts(temporaryDownload)
+            phase = enabled ? "not_downloaded" : "off"
+        } catch {
+            cleanupToneDownloadArtifacts(temporaryDownload)
+            phase = "error"; self.error = error.localizedDescription
+        }
     }
 
     private func setDownloadProgress(_ value: Int64) { downloadedBytes = value }
+    private func cleanupToneDownloadArtifacts(_ temporary: URL?) {
+        if let temporary { try? FileManager.default.removeItem(at: temporary) }
+        for file in toneFiles {
+            try? FileManager.default.removeItem(
+                at: URL(fileURLWithPath: modelDirectory.appending(path: file.path).path + ".part")
+            )
+        }
+    }
+
+    private static func compiledModelIsValid(_ url: URL) -> Bool {
+        guard let enumerator = FileManager.default.enumerator(
+            at: url,
+            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
+            options: [.skipsHiddenFiles]
+        ) else { return false }
+        for case let file as URL in enumerator {
+            let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+            if values?.isRegularFile == true, (values?.fileSize ?? 0) > 1_024 { return true }
+        }
+        return false
+    }
+
+    private static func removeDisposableCoreMLArtifacts(package: URL) {
+        let manager = FileManager.default
+        try? manager.removeItem(at: package)
+        let cache = manager.homeDirectoryForCurrentUser
+            .appending(path: "Library/Caches/Atlas/ToneCoreML", directoryHint: .isDirectory)
+        try? manager.removeItem(at: cache)
+    }
     private func saveSettings() { try? AtlasSecurity.writePrivate(Data("{\"enabled\":\(enabled)}\n".utf8), to: settingsURL) }
     private static func readEnabled(_ url: URL) -> Bool {
         guard let data = try? Data(contentsOf: url), let value = try? JSONDecoder().decode(JSONValue.self, from: data) else { return true }
@@ -378,16 +518,33 @@ private func insertWindow(_ value: ToneWindow, _ database: SQLiteDatabase) throw
 
 private struct ToneScore { let negative: Double, neutral: Double, positive: Double }
 
+private final class CoreMLPreparationProcess: @unchecked Sendable {
+    private let process = Process()
+
+    func start(script: URL, completion: @escaping @Sendable (Int32) -> Void) throws {
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = [script.path]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        process.terminationHandler = { process in completion(process.terminationStatus) }
+        try process.run()
+    }
+
+    func terminate() {
+        if process.isRunning { process.terminate() }
+    }
+}
+
 private final class NativeToneClassifier {
     private let tokenizer: RobertaTokenizer
     private let backend: ToneInferenceBackend
     let backendName: String
 
-    init(modelPackage: URL, onnxModel: URL, modelDirectory: URL) throws {
+    init(modelPackage: URL, compiledModel: URL, onnxModel: URL, modelDirectory: URL) throws {
         tokenizer = try RobertaTokenizer(vocab: modelDirectory.appending(path: "vocab.json"), merges: modelDirectory.appending(path: "merges.txt"))
         let preference = ProcessInfo.processInfo.environment["ATLAS_TONE_BACKEND"]
-        if preference != "onnx", FileManager.default.fileExists(atPath: modelPackage.path) {
-            backend = .coreML(try CoreMLToneInference(modelPackage: modelPackage))
+        if preference != "onnx", FileManager.default.fileExists(atPath: compiledModel.path) || FileManager.default.fileExists(atPath: modelPackage.path) {
+            backend = .coreML(try CoreMLToneInference(modelPackage: modelPackage, compiledModel: compiledModel))
             backendName = "coreml"
         } else {
             backend = .onnx(try ONNXToneInference(model: onnxModel))
@@ -414,6 +571,7 @@ func verifyToneRuntime(at directory: URL) throws -> JSONValue {
     let modelDirectory = directory.appending(path: "model", directoryHint: .isDirectory)
     let classifier = try NativeToneClassifier(
         modelPackage: directory.appending(path: "coreml/ToneClassifier.mlpackage"),
+        compiledModel: directory.appending(path: "coreml/ToneClassifier.mlmodelc"),
         onnxModel: modelDirectory.appending(path: "onnx/model_quantized.onnx"),
         modelDirectory: modelDirectory
     )
@@ -443,8 +601,12 @@ private final class CoreMLToneInference {
     private let compiled: URL
     private var models: [Int: MLModel] = [:]
 
-    init(modelPackage: URL) throws {
-        compiled = try MLModel.compileModel(at: modelPackage)
+    init(modelPackage: URL, compiledModel: URL) throws {
+        if FileManager.default.fileExists(atPath: compiledModel.path) {
+            compiled = compiledModel
+        } else {
+            compiled = try MLModel.compileModel(at: modelPackage)
+        }
     }
 
     func classify(ids sourceIDs: [Int64], mask sourceMask: [Int64], batch: Int, length: Int) throws -> [ToneScore] {

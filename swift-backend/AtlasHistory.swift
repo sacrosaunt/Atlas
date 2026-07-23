@@ -5,6 +5,7 @@ struct ChatMessageRecord: Codable, Sendable {
     let role: String
     let content: String
     let messages_read: Int?
+    let delivery_status: String
     let created_at: String
 }
 
@@ -61,6 +62,7 @@ final class AtlasHistory: @unchecked Sendable {
           role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
           content TEXT NOT NULL,
           messages_read INTEGER,
+          delivery_status TEXT NOT NULL DEFAULT 'delivered',
           created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS chat_messages_chat_id ON chat_messages(chat_id, id);
@@ -80,6 +82,36 @@ final class AtlasHistory: @unchecked Sendable {
         try ensureColumn(table: "insight_snapshots", name: "format_version", definition: "INTEGER NOT NULL DEFAULT 1")
         try ensureColumn(table: "chats", name: "summary", definition: "TEXT")
         try ensureColumn(table: "chat_messages", name: "messages_read", definition: "INTEGER")
+        let hadDeliveryStatus = try database.query("PRAGMA table_info(chat_messages)")
+            .contains { $0["name"]?.string == "delivery_status" }
+        try ensureColumn(table: "chat_messages", name: "delivery_status", definition: "TEXT NOT NULL DEFAULT 'delivered'")
+        try database.executeScript("""
+        UPDATE chat_messages AS pending
+        SET delivery_status = CASE
+          WHEN EXISTS (
+            SELECT 1 FROM chat_messages AS response
+            WHERE response.chat_id = pending.chat_id
+              AND response.id > pending.id
+              AND response.role = 'assistant'
+          ) THEN 'delivered'
+          ELSE 'failed'
+        END
+        WHERE pending.role = 'user' AND pending.delivery_status = 'sending';
+        """)
+        if !hadDeliveryStatus {
+            try database.executeScript("""
+            UPDATE chat_messages AS orphaned
+            SET delivery_status = 'failed'
+            WHERE orphaned.role = 'user'
+              AND orphaned.delivery_status = 'delivered'
+              AND NOT EXISTS (
+                SELECT 1 FROM chat_messages AS response
+                WHERE response.chat_id = orphaned.chat_id
+                  AND response.id > orphaned.id
+                  AND response.role = 'assistant'
+              );
+            """)
+        }
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path.path)
     }
 
@@ -115,7 +147,7 @@ final class AtlasHistory: @unchecked Sendable {
               let created = row["created_at"]?.string,
               let updated = row["updated_at"]?.string else { return nil }
         let messages = try database.query("""
-        SELECT id, role, content, messages_read, created_at
+        SELECT id, role, content, messages_read, delivery_status, created_at
         FROM chat_messages WHERE chat_id = ? ORDER BY id
         """, bindings: [.text(id)]).compactMap { message -> ChatMessageRecord? in
             guard let messageID = message["id"]?.int,
@@ -127,6 +159,7 @@ final class AtlasHistory: @unchecked Sendable {
                 role: role,
                 content: content,
                 messages_read: message["messages_read"]?.int,
+                delivery_status: message["delivery_status"]?.string ?? "delivered",
                 created_at: timestamp
             )
         }
@@ -150,25 +183,71 @@ final class AtlasHistory: @unchecked Sendable {
             "INSERT INTO chats (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
             bindings: [.text(id), .text(title), .text(timestamp), .text(timestamp)]
         )
-        try appendMessage(chatID: id, role: "user", content: prompt, timestamp: timestamp)
+        try appendMessage(chatID: id, role: "user", content: prompt, timestamp: timestamp, deliveryStatus: "sending")
         return try getChat(id)!
     }
 
+    @discardableResult
     func appendMessage(
         chatID: String,
         role: String,
         content: String,
         timestamp: String = atlasNow(),
-        messagesRead: Int? = nil
-    ) throws {
+        messagesRead: Int? = nil,
+        deliveryStatus: String = "delivered"
+    ) throws -> Int {
         try database.execute(
-            "INSERT INTO chat_messages (chat_id, role, content, messages_read, created_at) VALUES (?, ?, ?, ?, ?)",
-            bindings: [.text(chatID), .text(role), .text(content), messagesRead.map { .integer(Int64($0)) } ?? .null, .text(timestamp)]
+            "INSERT INTO chat_messages (chat_id, role, content, messages_read, delivery_status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            bindings: [.text(chatID), .text(role), .text(content), messagesRead.map { .integer(Int64($0)) } ?? .null, .text(deliveryStatus), .text(timestamp)]
         )
+        let messageID = Int(database.lastInsertRowID)
         try database.execute(
             "UPDATE chats SET updated_at = ? WHERE id = ?",
             bindings: [.text(timestamp), .text(chatID)]
         )
+        return messageID
+    }
+
+    func getMessage(chatID: String, messageID: Int) throws -> ChatMessageRecord? {
+        guard let message = try database.query("""
+        SELECT id, role, content, messages_read, delivery_status, created_at
+        FROM chat_messages WHERE chat_id = ? AND id = ?
+        """, bindings: [.text(chatID), .integer(Int64(messageID))]).first,
+              let id = message["id"]?.int,
+              let role = message["role"]?.string,
+              let content = message["content"]?.string,
+              let timestamp = message["created_at"]?.string else { return nil }
+        return .init(
+            id: id,
+            role: role,
+            content: content,
+            messages_read: message["messages_read"]?.int,
+            delivery_status: message["delivery_status"]?.string ?? "delivered",
+            created_at: timestamp
+        )
+    }
+
+    func updateMessageDelivery(chatID: String, messageID: Int, status: String) throws {
+        try database.execute(
+            "UPDATE chat_messages SET delivery_status = ? WHERE chat_id = ? AND id = ? AND role = 'user'",
+            bindings: [.text(status), .text(chatID), .integer(Int64(messageID))]
+        )
+    }
+
+    func failMessageIfSending(chatID: String, messageID: Int) throws {
+        try database.execute(
+            "UPDATE chat_messages SET delivery_status = 'failed' WHERE chat_id = ? AND id = ? AND role = 'user' AND delivery_status = 'sending'",
+            bindings: [.text(chatID), .integer(Int64(messageID))]
+        )
+    }
+
+    @discardableResult
+    func deleteMessage(chatID: String, messageID: Int) throws -> Bool {
+        try database.execute(
+            "DELETE FROM chat_messages WHERE chat_id = ? AND id = ?",
+            bindings: [.text(chatID), .integer(Int64(messageID))]
+        )
+        return database.changes > 0
     }
 
     func attachThread(chatID: String, threadID: String) throws {
